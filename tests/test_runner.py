@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import logging
@@ -851,3 +852,116 @@ def test_extract_time_format_strips_date() -> None:
     assert runner._extract_time_format("%m-%d %H:%M") == "%H:%M"
     # No time code at all — returns full format
     assert runner._extract_time_format("%Y.%m.%d") == "%Y.%m.%d"
+
+
+# --- Reconnect logic tests ---
+
+
+class _FakeClient:
+    """Minimal fake TelegramClient for reconnect tests."""
+
+    def __init__(self, side_effects: list[BaseException | None]) -> None:
+        self._side_effects = list(side_effects)
+        self.connect_count = 0
+
+    async def run_until_disconnected(self) -> None:
+        effect = self._side_effects.pop(0)
+        if effect is not None:
+            raise effect
+
+    async def connect(self) -> None:
+        self.connect_count += 1
+
+
+@pytest.mark.asyncio
+async def test_run_with_reconnect_retries_on_connection_error(tmp_path: Path) -> None:
+    """ConnectionError triggers retry; second attempt succeeds."""
+    client = _FakeClient([ConnectionError("fail"), None])
+    config = build_config(tmp_path)
+    notifications: list[str] = []
+
+    original = runner._send_reconnect_notification
+
+    async def _capture_notification(cl, cfg, downtime, *, fallback_client=None):
+        notifications.append(str(downtime))
+
+    runner._send_reconnect_notification = _capture_notification
+    try:
+        with _patch_sleep():
+            await runner._run_with_reconnect(client, client, config)
+    finally:
+        runner._send_reconnect_notification = original
+
+    assert client.connect_count == 1
+    assert len(notifications) == 1
+
+
+@pytest.mark.asyncio
+async def test_run_with_reconnect_raises_auth_error(tmp_path: Path) -> None:
+    """Auth-related errors are not retried."""
+    client = _FakeClient([ConnectionError("authorization key invalid")])
+    config = build_config(tmp_path)
+    with pytest.raises(ConnectionError, match="authorization"):
+        await runner._run_with_reconnect(client, client, config)
+    assert client.connect_count == 0
+
+
+@pytest.mark.asyncio
+async def test_run_with_reconnect_backoff_increases(tmp_path: Path) -> None:
+    """Backoff doubles when connect() also fails."""
+    client = _FakeClient([
+        ConnectionError("net down"),
+        ConnectionError("still down"),
+        None,
+    ])
+    delays: list[float] = []
+    original_connect = client.connect
+
+    async def _failing_then_ok() -> None:
+        if client.connect_count == 0:
+            client.connect_count += 1
+            raise OSError("connect failed")
+        client.connect_count += 1
+
+    client.connect = _failing_then_ok
+    config = build_config(tmp_path)
+
+    original_notification = runner._send_reconnect_notification
+    runner._send_reconnect_notification = _noop_notification
+    try:
+        with _patch_sleep(record=delays):
+            await runner._run_with_reconnect(client, client, config)
+    finally:
+        runner._send_reconnect_notification = original_notification
+
+    # First sleep = 10s, second sleep = 20s (doubled after connect failure)
+    assert delays[0] == 10
+    assert delays[1] == 20
+
+
+def test_is_auth_error() -> None:
+    assert runner._is_auth_error(ConnectionError("authorization key invalid"))
+    assert runner._is_auth_error(ConnectionError("user session revoked"))
+    assert runner._is_auth_error(ConnectionError("account deactivated"))
+    assert not runner._is_auth_error(ConnectionError("Network is unreachable"))
+    assert not runner._is_auth_error(OSError("[Errno 51]"))
+
+
+async def _noop_notification(cl, cfg, downtime, *, fallback_client=None):
+    pass
+
+
+@contextmanager
+def _patch_sleep(record: list[float] | None = None):
+    """Replace asyncio.sleep in runner module with an instant no-op."""
+    original = asyncio.sleep
+
+    async def _fake_sleep(delay, *a, **kw):
+        if record is not None:
+            record.append(delay)
+
+    runner.asyncio.sleep = _fake_sleep
+    try:
+        yield
+    finally:
+        runner.asyncio.sleep = original

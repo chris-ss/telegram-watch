@@ -4,6 +4,9 @@
 
 > Entries are arranged from newest to oldest so the latest release notes stay at the top. Each bullet references the requirement(s) that introduced the change.
 
+## 1.3.0 — 2026-03-04
+- Add automatic reconnection with exponential backoff when network drops during daemon mode. The watcher now survives temporary network outages instead of crashing, and sends a recovery notification to the control chat once reconnected (REQ-20260304-001-daemon-reconnect-on-network-loss).
+
 ## 1.2.1 — 2026-02-13
 - Simplified report file captions in the control chat from verbose ISO timestamps to a concise two-line format with user-configured time formatting (REQ-20260213-001-humanize-report-caption).
 
