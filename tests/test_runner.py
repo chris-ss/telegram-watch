@@ -807,6 +807,143 @@ async def test_summary_loop_continues_after_send_exception(monkeypatch, tmp_path
     assert "Summary send failed for target 'default' (chat_id=-123)" in caplog.text
 
 
+# --- skip_html_report tests ---
+
+
+@pytest.mark.asyncio
+async def test_send_report_bundle_sends_html_by_default(monkeypatch, tmp_path: Path):
+    """With skip_html_report=False (default), HTML file is sent."""
+    config = build_config(tmp_path)
+    control = config.control_groups["default"]
+    target = config.targets[0]
+    since = datetime.now(timezone.utc) - timedelta(hours=1)
+    until = datetime.now(timezone.utc)
+    report_path = tmp_path / "report.html"
+    report_path.write_text("<html></html>")
+
+    sent_files: list[Path] = []
+
+    async def fake_send_file_with_fallback(
+        _client, _fallback, _chat_id, file_path, *, caption=None, reply_to=None
+    ):
+        sent_files.append(file_path)
+
+    async def fake_send_message_with_fallback(
+        _client, _fallback, _chat_id, _text, *, parse_mode=None, reply_to=None
+    ):
+        pass
+
+    monkeypatch.setattr(runner, "_send_file_with_fallback", fake_send_file_with_fallback)
+    monkeypatch.setattr(runner, "_send_message_with_fallback", fake_send_message_with_fallback)
+    monkeypatch.setattr(runner, "send_bark_notification", lambda *a, **k: asyncio.sleep(0))
+
+    await runner._send_report_bundle(
+        object(), config, control, target, [], since, until, report_path
+    )
+
+    assert report_path in sent_files
+
+
+@pytest.mark.asyncio
+async def test_send_report_bundle_skips_html_when_enabled(monkeypatch, tmp_path: Path):
+    """With skip_html_report=True, HTML file is NOT sent but messages still go through."""
+    config = build_config(tmp_path)
+    target = config.targets[0]
+    control_skip = ControlGroupConfig(
+        key="default",
+        control_chat_id=-456,
+        is_forum=False,
+        topic_routing_enabled=False,
+        topic_target_map=MappingProxyType({}),
+        skip_html_report=True,
+    )
+    since = datetime.now(timezone.utc) - timedelta(hours=1)
+    until = datetime.now(timezone.utc)
+    report_path = tmp_path / "report.html"
+    report_path.write_text("<html></html>")
+
+    sent_files: list[Path] = []
+    sent_messages: list[str] = []
+
+    async def fake_send_file_with_fallback(
+        _client, _fallback, _chat_id, file_path, *, caption=None, reply_to=None
+    ):
+        sent_files.append(file_path)
+
+    async def fake_send_message_with_fallback(
+        _client, _fallback, _chat_id, text, *, parse_mode=None, reply_to=None
+    ):
+        sent_messages.append(text)
+
+    monkeypatch.setattr(runner, "_send_file_with_fallback", fake_send_file_with_fallback)
+    monkeypatch.setattr(runner, "_send_message_with_fallback", fake_send_message_with_fallback)
+    monkeypatch.setattr(runner, "send_bark_notification", lambda *a, **k: asyncio.sleep(0))
+
+    message = DbMessage(
+        chat_id=target.target_chat_id,
+        message_id=1,
+        sender_id=111,
+        date=datetime.now(timezone.utc),
+        text="hello",
+        reply_to_msg_id=None,
+        replied_sender_id=None,
+        replied_date=None,
+        replied_text=None,
+        media=[],
+    )
+
+    await runner._send_report_bundle(
+        object(), config, control_skip, target, [message], since, until, report_path
+    )
+
+    # HTML file should NOT have been sent
+    assert report_path not in sent_files
+    # But the individual message should have been sent
+    assert len(sent_messages) == 1
+    assert "hello" in sent_messages[0]
+
+
+@pytest.mark.asyncio
+async def test_send_report_bundle_skips_topic_reports_when_enabled(monkeypatch, tmp_path: Path):
+    """With skip_html_report=True and topic routing, per-user HTML reports are NOT sent."""
+    config = build_config(tmp_path)
+    target = config.targets[0]
+    control_skip = ControlGroupConfig(
+        key="default",
+        control_chat_id=-456,
+        is_forum=True,
+        topic_routing_enabled=True,
+        topic_target_map=MappingProxyType({target.target_chat_id: MappingProxyType({111: 9001})}),
+        skip_html_report=True,
+    )
+    since = datetime.now(timezone.utc) - timedelta(hours=1)
+    until = datetime.now(timezone.utc)
+    report_path = tmp_path / "reports" / "report.html"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text("<html></html>")
+
+    topic_reports_called = []
+
+    async def fake_send_topic_reports(*args, **kwargs):
+        topic_reports_called.append(True)
+
+    async def fake_send_message_with_fallback(
+        _client, _fallback, _chat_id, _text, *, parse_mode=None, reply_to=None
+    ):
+        pass
+
+    monkeypatch.setattr(runner, "_send_topic_reports", fake_send_topic_reports)
+    monkeypatch.setattr(runner, "_send_message_with_fallback", fake_send_message_with_fallback)
+    monkeypatch.setattr(runner, "send_bark_notification", lambda *a, **k: asyncio.sleep(0))
+
+    await runner._send_report_bundle(
+        object(), config, control_skip, target, [], since, until, report_path
+    )
+
+    # _send_topic_reports should NOT have been called
+    assert topic_reports_called == []
+
+
 # --- _format_report_caption / _extract_time_format tests ---
 
 

@@ -19,6 +19,7 @@
 - **ワンクリック起動**：Conda（`tgwatch`）優先で起動し、利用不可時は自動で `venv` にフォールバック。
 - **GUI ランナー制御**：Run once（単一ターゲット選択・push 任意）、Run daemon、Stop daemon、ライブログ確認を一画面で実行。
 - **安全な実行ガード**：session 事前チェック、長期保持時の確認フロー、GUI 上の明示的なエラーメッセージ。
+- **自動再接続**：daemon モードで一時的なネットワーク障害発生時に指数バックオフで自動再接続し、復旧後コントロールチャットに通知を送信。
 - **ローカル永続化**：メッセージを SQLite に保存し、メディアをスナップショット化して HTML レポートを生成。
 - **プライバシー重視設計**：クラウド依存なし、機密値のログ出力なし、実行時の機密ファイルは git 対象外。
 
@@ -126,6 +127,7 @@ python -m pip install -U pip
    - `[targets.tracked_user_aliases]`（オプション：ID と表示名の対応表）
    - `control_groups.<name>.control_chat_id`（レポート・コマンドの送受信先）
    - `control_groups.<name>.is_forum` / `control_groups.<name>.topic_routing_enabled` / `[control_groups.<name>.topic_target_map.<target_chat_id>]`（任意：ユーザー別に TG Topic へ振り分け）
+   - `control_groups.<name>.skip_html_report`（任意、デフォルト `false`；`true` にするとコントロールチャットへの送信時に HTML レポートファイルをスキップし、個別メッセージのみ送信）
    - `storage.db_path` と `storage.media_dir`
    - `reporting.reports_dir`, `reporting.summary_interval_minutes`（デフォルトのレポート間隔）
    - `reporting.timezone`（例：`Asia/Tokyo`、`America/Los_Angeles` 等）

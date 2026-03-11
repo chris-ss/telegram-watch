@@ -32,6 +32,7 @@ control_group = "main"
 control_chat_id = -1009876543210
 is_forum = false
 topic_routing_enabled = false
+skip_html_report = false  # set true to only send individual messages, skip HTML report file
 
 [control_groups.main.topic_target_map."-1001234567890"]
 11111111 = 9001

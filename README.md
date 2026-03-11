@@ -19,6 +19,7 @@ Turn noisy Telegram groups into a private, structured signal system — **fully 
 - **One-Click Local Launcher**: Start with Conda-first (`tgwatch`) setup and automatic `venv` fallback.
 - **GUI Runner Controls**: Run once (with optional target and push), start daemon, stop daemon, and inspect live logs in one place.
 - **Safe Run Guardrails**: Session prechecks, retention confirmation for long windows, and explicit in-UI error feedback.
+- **Auto-Reconnect**: Daemon mode survives temporary network outages with exponential backoff and sends a recovery notification once reconnected.
 - **Local Persistence by Default**: Archive messages in SQLite, keep media snapshots, and generate HTML reports for review.
 - **Privacy by Design**: No cloud dependency, no secret logging, and sensitive runtime files excluded from git.
 
@@ -127,6 +128,7 @@ Once installed and your environment is active, the rest is the same for everyone
    - `[targets.tracked_user_aliases]` (optional ID→alias mapping for nicer reports)
    - `control_groups.<name>.control_chat_id` (where digests + commands live)
    - `control_groups.<name>.is_forum` / `control_groups.<name>.topic_routing_enabled` / `[control_groups.<name>.topic_target_map.<target_chat_id>]` (optional per-user routing to Telegram Topics)
+   - `control_groups.<name>.skip_html_report` (optional, default `false`; set `true` to skip sending the HTML report file and only push individual messages)
    - `storage.db_path` & `storage.media_dir`
    - `reporting.reports_dir` & `reporting.summary_interval_minutes` (default report interval if a target does not override it)
    - `reporting.timezone` (optional, e.g., `Asia/Shanghai`, `America/Los_Angeles`, `America/New_York`, `Asia/Tokyo`)

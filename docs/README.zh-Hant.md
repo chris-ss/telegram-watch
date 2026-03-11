@@ -19,6 +19,7 @@
 - **一鍵本機啟動器**：啟動流程採 Conda（`tgwatch`）優先，並自動回退到 `venv`。
 - **GUI 執行控制**：支援 Run once（可選單目標與 push）、Run daemon、Stop daemon，並可查看即時日誌。
 - **安全執行護欄**：啟動前 session 檢查、長保留視窗確認，以及介面內可見錯誤提示。
+- **自動重連**：daemon 模式在臨時網路故障時自動重連（指數退避），恢復後向控制群發送通知。
 - **預設本機持久化**：訊息歸檔至 SQLite、媒體快照落盤、自動產生 HTML 報告。
 - **隱私優先設計**：不依賴雲端、不記錄敏感金鑰，執行期敏感檔預設不進 git。
 
@@ -126,6 +127,7 @@ python -m pip install -U pip
    - `[targets.tracked_user_aliases]`（可選 ID→別名對應）
    - `control_groups.<name>.control_chat_id`（接收報告與指令的控制群）
    - `control_groups.<name>.is_forum` / `control_groups.<name>.topic_routing_enabled` / `[control_groups.<name>.topic_target_map.<target_chat_id>]`（可選：依使用者分流到 TG Topic）
+   - `control_groups.<name>.skip_html_report`（可選，預設 `false`；設為 `true` 時推送控制群僅發逐條訊息，不發 HTML 報告檔案）
    - `storage.db_path` 與 `storage.media_dir`
    - `reporting.reports_dir` 與 `reporting.summary_interval_minutes`（預設報告頻率）
    - `reporting.timezone`（如 `Asia/Taipei`、`America/Los_Angeles` 等）

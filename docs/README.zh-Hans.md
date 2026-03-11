@@ -19,6 +19,7 @@
 - **一键本地启动器**：启动流程为 Conda（`tgwatch`）优先，自动回退到 `venv`。
 - **GUI 运行控制**：支持 Run once（可选单目标与 push）、Run daemon、Stop daemon，并可查看实时日志。
 - **安全运行护栏**：启动前 session 检查、长保留窗口确认、以及界面内可见错误提示。
+- **自动重连**：daemon 模式在临时网络故障时自动重连（指数退避），恢复后向控制群发送通知。
 - **默认本地持久化**：消息归档到 SQLite，媒体快照落盘，自动生成 HTML 报告。
 - **隐私优先设计**：不依赖云服务、不记录敏感密钥，运行时敏感文件默认不进 git。
 
@@ -126,6 +127,7 @@ python -m pip install -U pip
    - `[targets.tracked_user_aliases]`（可选的 ID→别名映射）
    - `control_groups.<name>.control_chat_id`（接收报告与命令的控制群）
    - `control_groups.<name>.is_forum` / `control_groups.<name>.topic_routing_enabled` / `[control_groups.<name>.topic_target_map.<target_chat_id>]`（可选：按用户分流到 TG Topic）
+   - `control_groups.<name>.skip_html_report`（可选，默认 `false`；设为 `true` 时推送控制群只发逐条消息，不发 HTML 报告文件）
    - `storage.db_path` 与 `storage.media_dir`
    - `reporting.reports_dir` 与 `reporting.summary_interval_minutes`（默认报告频率）
    - `reporting.timezone`（如 `Asia/Shanghai`、`America/Los_Angeles` 等）
