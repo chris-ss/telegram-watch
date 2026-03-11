@@ -259,6 +259,73 @@ async def run_reply_cleanup(
     return stats
 
 
+_RECONNECT_INITIAL_DELAY = 10
+_RECONNECT_MAX_DELAY = 300
+_RECONNECT_NETWORK_ERRORS = (ConnectionError, OSError)
+
+
+async def _run_with_reconnect(
+    client: TelegramClient,
+    send_client: TelegramClient,
+    config: Config,
+    *,
+    fallback_client: TelegramClient | None = None,
+) -> None:
+    """Run ``client.run_until_disconnected()`` with auto-reconnect on network errors."""
+    delay = _RECONNECT_INITIAL_DELAY
+    while True:
+        try:
+            await client.run_until_disconnected()
+            return  # graceful disconnect
+        except _RECONNECT_NETWORK_ERRORS as exc:
+            if _is_auth_error(exc):
+                raise
+            disconnected_at = utc_now()
+            logger.warning(
+                "Connection lost: %s. Reconnecting in %ds...", exc, delay,
+            )
+            await asyncio.sleep(delay)
+            try:
+                await client.connect()
+            except _RECONNECT_NETWORK_ERRORS:
+                delay = min(delay * 2, _RECONNECT_MAX_DELAY)
+                continue
+            # Connected — reset backoff and notify
+            downtime = utc_now() - disconnected_at
+            delay = _RECONNECT_INITIAL_DELAY
+            logger.info("Reconnected after %s", downtime)
+            await _send_reconnect_notification(
+                send_client, config, downtime,
+                fallback_client=fallback_client,
+            )
+
+
+def _is_auth_error(exc: BaseException) -> bool:
+    """Return True for authentication/authorization failures that should not be retried."""
+    auth_keywords = ("auth", "authorization", "session", "banned", "deactivated")
+    msg = str(exc).lower()
+    return any(kw in msg for kw in auth_keywords)
+
+
+async def _send_reconnect_notification(
+    client: TelegramClient,
+    config: Config,
+    downtime: timedelta,
+    *,
+    fallback_client: TelegramClient | None = None,
+) -> None:
+    minutes = int(downtime.total_seconds()) // 60
+    seconds = int(downtime.total_seconds()) % 60
+    message = f"Watcher reconnected after {minutes}m{seconds}s downtime."
+    try:
+        for control in config.control_groups.values():
+            await _send_message_with_fallback(
+                client, fallback_client, control.control_chat_id, message,
+            )
+    except Exception as notify_exc:
+        logger.warning("Failed to send reconnect notification: %s", notify_exc)
+
+
 async def run_daemon(config: Config) -> None:
     _purge_old_reports(
         config.reporting.reports_dir,
@@ -312,7 +379,7 @@ async def run_daemon(config: Config) -> None:
 
     heartbeat_loop.start()
     try:
-        await client.run_until_disconnected()
+        await _run_with_reconnect(client, send_client, config, fallback_client=fallback_client)
     except Exception as exc:
         await _send_error_notification(send_client, config, exc, fallback_client=fallback_client)
         raise

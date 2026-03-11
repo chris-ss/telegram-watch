@@ -4,8 +4,11 @@
 
 > 条目按时间从新到旧排列，最新版本在最上方。每条变更都会标注对应的需求编号。
 
-## 1.3.0 — 2026-03-10
+## 1.4.0 — 2026-03-10
 - 新增 GitHub Actions 工作流，支持定时每日消息抓取与 Artifact 报告存储，并为 CI 环境增加非交互模式支持（REQ-20260310-001-github-actions-daily-summary）。
+
+## 1.3.0 — 2026-03-04
+- 新增 daemon 模式网络断线自动重连功能，采用指数退避策略（10s→300s）。监控进程在临时网络故障时不再崩溃退出，重连成功后向控制群发送恢复通知（REQ-20260304-001-daemon-reconnect-on-network-loss）。
 
 ## 1.0.0 — 2026-02-04
 - 交付多目标监控与控制群路由，并提供本地 GUI 与控制群映射体验优化（REQ-20260202-001-multi-admin-monitoring，REQ-20260203-001-config-gui-design，REQ-20260204-003-gui-control-mapping-ux）。
