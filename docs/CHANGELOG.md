@@ -4,10 +4,9 @@
 
 > Entries are arranged from newest to oldest so the latest release notes stay at the top. Each bullet references the requirement(s) that introduced the change.
 
-## 1.4.0 — 2026-03-10
-- Added GitHub Actions workflow for scheduled daily message fetching with artifact-based report storage, plus non-interactive mode support for CI environments (REQ-20260310-001-github-actions-daily-summary).
-
-## 1.3.0 — 2026-03-04
+## 1.5.0 — 2026-03-11
+- Add per-control-group `skip_html_report` option to send only individual messages without the HTML report file when pushing to the control chat (REQ-20260310-001-skip-html-report-option).
+- Add GitHub Actions workflow for scheduled daily message fetching with artifact-based report storage, plus non-interactive mode support for CI environments (REQ-20260310-001-github-actions-daily-summary).
 - Add automatic reconnection with exponential backoff when network drops during daemon mode. The watcher now survives temporary network outages instead of crashing, and sends a recovery notification to the control chat once reconnected (REQ-20260304-001-daemon-reconnect-on-network-loss).
 
 ## 1.2.1 — 2026-02-13

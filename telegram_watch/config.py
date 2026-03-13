@@ -54,6 +54,7 @@ class ControlGroupConfig:
     is_forum: bool
     topic_routing_enabled: bool
     topic_target_map: Mapping[int, Mapping[int, int]]
+    skip_html_report: bool = False
 
 
 @dataclass(frozen=True)
@@ -470,12 +471,14 @@ def _parse_control_group(
         raise ConfigError(f"{label}.topic_routing_enabled requires {label}.is_forum = true")
     if topic_routing_enabled and not topic_target_map:
         raise ConfigError(f"{label}.topic_routing_enabled requires {label}.topic_target_map to be set")
+    skip_html_report = _parse_bool(raw.get("skip_html_report", False))
     return ControlGroupConfig(
         key=key,
         control_chat_id=control_chat_id,
         is_forum=is_forum,
         topic_routing_enabled=topic_routing_enabled,
         topic_target_map=MappingProxyType(topic_target_map),
+        skip_html_report=skip_html_report,
     )
 
 

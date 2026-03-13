@@ -1073,18 +1073,20 @@ async def _send_report_bundle(
     fallback_client: TelegramClient | None = None,
 ) -> None:
     control_chat_id = control.control_chat_id
+    skip_html = control.skip_html_report
     if _topic_routing_enabled(control):
-        await _send_topic_reports(
-            client,
-            config,
-            control,
-            target,
-            messages,
-            since,
-            until,
-            report_path.parent,
-            fallback_client=fallback_client,
-        )
+        if not skip_html:
+            await _send_topic_reports(
+                client,
+                config,
+                control,
+                target,
+                messages,
+                since,
+                until,
+                report_path.parent,
+                fallback_client=fallback_client,
+            )
         await _send_messages_to_control(
             client,
             config,
@@ -1094,14 +1096,15 @@ async def _send_report_bundle(
             fallback_client=fallback_client,
         )
     else:
-        caption = _format_report_caption("Report", len(messages), since, until, config)
-        await _send_file_with_fallback(
-            client,
-            fallback_client,
-            control_chat_id,
-            report_path,
-            caption=caption,
-        )
+        if not skip_html:
+            caption = _format_report_caption("Report", len(messages), since, until, config)
+            await _send_file_with_fallback(
+                client,
+                fallback_client,
+                control_chat_id,
+                report_path,
+                caption=caption,
+            )
         await _send_messages_to_control(
             client,
             config,

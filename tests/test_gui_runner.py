@@ -338,6 +338,7 @@ def test_render_toml_quotes_control_group_key() -> None:
                 "control_chat_id": -2001,
                 "is_forum": True,
                 "topic_routing_enabled": True,
+                "skip_html_report": False,
                 "topic_target_map": [
                     {"target_chat_id": -1001, "user_id": 123, "topic_id": 9001, "user_key": ""}
                 ],

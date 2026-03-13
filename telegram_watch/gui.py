@@ -484,6 +484,7 @@ const blankControlGroup = () => ({
   control_chat_id: "",
   is_forum: false,
   topic_routing_enabled: false,
+  skip_html_report: false,
   topic_target_map: [{ user_key: "", target_chat_id: "", user_id: "", topic_id: "" }]
 });
 
@@ -1272,6 +1273,13 @@ function render() {
                 <option value="true" ${group.topic_routing_enabled ? "selected" : ""}>true</option>
               </select>
             </div>
+            <div class="field">
+              <label>Skip HTML Report</label>
+              <select data-field="control_groups.${idx}.skip_html_report">
+                <option value="false" ${group.skip_html_report ? "" : "selected"}>false</option>
+                <option value="true" ${group.skip_html_report ? "selected" : ""}>true</option>
+              </select>
+            </div>
           </div>
           <div class="status" style="margin-top:12px;">
             Mapped targets: ${(() => {
@@ -1448,6 +1456,7 @@ function bindEvents() {
       field.endsWith(".key") ||
       field.endsWith(".topic_routing_enabled") ||
       field.endsWith(".is_forum") ||
+      field.endsWith(".skip_html_report") ||
       field.endsWith(".control_group") ||
       field.includes(".topic_target_map.")
     ) {
@@ -2321,6 +2330,7 @@ def _normalize_config(raw: dict[str, Any]) -> dict[str, Any]:
                 "control_chat_id": group.get("control_chat_id", ""),
                 "is_forum": bool(group.get("is_forum", False)),
                 "topic_routing_enabled": bool(group.get("topic_routing_enabled", False)),
+                "skip_html_report": bool(group.get("skip_html_report", False)),
                 "topic_target_map": topic_map,
             }
         )
@@ -2346,6 +2356,7 @@ def blank_control_group() -> dict[str, Any]:
         "control_chat_id": "",
         "is_forum": False,
         "topic_routing_enabled": False,
+        "skip_html_report": False,
         "topic_target_map": [
             {"user_key": "", "target_chat_id": "", "user_id": "", "topic_id": ""}
         ],
@@ -2398,6 +2409,7 @@ def _validate_payload(payload: dict[str, Any], raw_existing: dict[str, Any]) -> 
         control_keys.append(key)
         chat_id = _coerce_int(raw.get("control_chat_id"), f"control_groups[{key}].control_chat_id", errors)
         is_forum = bool(raw.get("is_forum", False))
+        skip_html_report = bool(raw.get("skip_html_report", False))
         topic_enabled = bool(raw.get("topic_routing_enabled", False))
         topic_map_entries = raw.get("topic_target_map", []) or []
         topic_map = []
@@ -2464,6 +2476,7 @@ def _validate_payload(payload: dict[str, Any], raw_existing: dict[str, Any]) -> 
                 "control_chat_id": chat_id,
                 "is_forum": is_forum,
                 "topic_routing_enabled": topic_enabled,
+                "skip_html_report": skip_html_report,
                 "topic_target_map": topic_map,
             }
         )
@@ -2684,6 +2697,7 @@ def _render_toml(config: dict[str, Any], raw_existing: dict[str, Any]) -> str:
                 f"control_chat_id = {group['control_chat_id']}",
                 f"is_forum = {toml_bool(group['is_forum'])}",
                 f"topic_routing_enabled = {toml_bool(group['topic_routing_enabled'])}",
+                f"skip_html_report = {toml_bool(group.get('skip_html_report', False))}",
             ]
         )
         topic_map = group.get("topic_target_map", [])

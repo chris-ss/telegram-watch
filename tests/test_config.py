@@ -855,6 +855,55 @@ def test_users_per_target_limit_exceeded(tmp_path):
         load_config(cfg_path)
 
 
+def test_skip_html_report_defaults_false(tmp_path):
+    cfg_path = write_config(
+        tmp_path,
+        """
+        [telegram]
+        api_id = 42
+        api_hash = "abcdefghijk"
+
+        [target]
+        target_chat_id = -1001
+        tracked_user_ids = [123]
+
+        [control]
+        control_chat_id = -1002
+
+        [storage]
+        db_path = "data/app.sqlite3"
+        media_dir = "data/media"
+        """,
+    )
+    config = load_config(cfg_path)
+    assert config.control_groups["default"].skip_html_report is False
+
+
+def test_skip_html_report_parses_true(tmp_path):
+    cfg_path = write_config(
+        tmp_path,
+        """
+        [telegram]
+        api_id = 42
+        api_hash = "abcdefghijk"
+
+        [target]
+        target_chat_id = -1001
+        tracked_user_ids = [123]
+
+        [control]
+        control_chat_id = -1002
+        skip_html_report = true
+
+        [storage]
+        db_path = "data/app.sqlite3"
+        media_dir = "data/media"
+        """,
+    )
+    config = load_config(cfg_path)
+    assert config.control_groups["default"].skip_html_report is True
+
+
 def test_control_group_limit_exceeded(tmp_path):
     controls = "\n\n".join(
         f"""
