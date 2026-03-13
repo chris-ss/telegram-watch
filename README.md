@@ -2,8 +2,7 @@
 
 [English](README.md) | [简体中文](docs/README.zh-Hans.md) | [繁體中文](docs/README.zh-Hant.md) | [日本語](docs/README.ja.md)
 
-**Docs Version:** `v1.0.5` (release `v1.2.1`)
-*Unreleased: `v1.5.0`*
+**Docs Version:** `v1.0.5` (release `v1.5.0`)
 
 [Follow on X](https://x.com/o1xhack) · [Telegram EN channel](https://t.me/lalabeng) · [Telegram 中文频道](https://t.me/o1xinsight)
 
@@ -40,7 +39,7 @@ Go to [my.telegram.org](https://my.telegram.org/), sign in with your phone numbe
 Clone a stable release (recommended):
 
 ```bash
-git clone --branch v1.2.1 https://github.com/o1xhack/telegram-watch.git
+git clone --branch v1.5.0 https://github.com/o1xhack/telegram-watch.git
 cd telegram-watch
 ```
 
@@ -112,7 +111,7 @@ pip install -e .
 **Tagged release (stable, version-pinned):**
 
 ```bash
-pip install "git+https://github.com/o1xhack/telegram-watch.git@v1.2.1"
+pip install "git+https://github.com/o1xhack/telegram-watch.git@v1.5.0"
 ```
 
 ### Set up config and run
