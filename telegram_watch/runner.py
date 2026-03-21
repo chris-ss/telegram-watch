@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import shutil
+import sqlite3
 import traceback
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import Awaitable, Callable, Sequence, TypeVar
 
 from telethon import TelegramClient, events, errors
+from telethon.sessions import SQLiteSession
 from telethon.tl.custom import message as custom_message
 
 from .config import (
@@ -73,6 +75,18 @@ def _phone_prompt(role: str) -> str:
         )
     print(f"Next: log in {label}.")
     return input(f"{label} phone (or bot token): ")
+
+
+class _WalSqliteSession(SQLiteSession):
+    """SQLiteSession with WAL mode and busy_timeout for cloud-sync resilience."""
+
+    def _cursor(self):
+        c = super()._cursor()
+        if not getattr(self, "_wal_set", False):
+            self._conn.execute("PRAGMA journal_mode = WAL")
+            self._conn.execute("PRAGMA busy_timeout = 5000")
+            self._wal_set = True
+        return c
 
 
 def _resolve_once_targets(config: Config, selector: str | None) -> tuple[TargetGroupConfig, ...]:
@@ -263,6 +277,8 @@ async def run_reply_cleanup(
 _RECONNECT_INITIAL_DELAY = 10
 _RECONNECT_MAX_DELAY = 300
 _RECONNECT_NETWORK_ERRORS = (ConnectionError, OSError)
+_SQLITE_MAX_RETRIES = 3
+_SQLITE_RETRY_DELAY = 1
 
 
 async def _run_with_reconnect(
@@ -274,13 +290,29 @@ async def _run_with_reconnect(
 ) -> None:
     """Run ``client.run_until_disconnected()`` with auto-reconnect on network errors."""
     delay = _RECONNECT_INITIAL_DELAY
+    sqlite_retries = 0
     while True:
         try:
             await client.run_until_disconnected()
             return  # graceful disconnect
+        except sqlite3.OperationalError as exc:
+            sqlite_retries += 1
+            if sqlite_retries > _SQLITE_MAX_RETRIES:
+                logger.error(
+                    "sqlite3.OperationalError persisted after %d retries: %s",
+                    _SQLITE_MAX_RETRIES, exc,
+                )
+                raise
+            logger.warning(
+                "sqlite3.OperationalError (retry %d/%d): %s",
+                sqlite_retries, _SQLITE_MAX_RETRIES, exc,
+            )
+            await asyncio.sleep(_SQLITE_RETRY_DELAY)
+            continue
         except _RECONNECT_NETWORK_ERRORS as exc:
             if _is_auth_error(exc):
                 raise
+            sqlite_retries = 0  # reset on network-level reconnect
             disconnected_at = utc_now()
             logger.warning(
                 "Connection lost: %s. Reconnecting in %ds...", exc, delay,
@@ -454,7 +486,7 @@ def _build_client(config: Config) -> TelegramClient:
     session_path = config.telegram.session_file
     session_path.parent.mkdir(parents=True, exist_ok=True)
     return TelegramClient(
-        str(session_path),
+        _WalSqliteSession(str(session_path)),
         config.telegram.api_id,
         config.telegram.api_hash,
     )
@@ -466,7 +498,7 @@ def _build_sender_client(config: Config) -> TelegramClient | None:
     session_path = config.sender.session_file
     session_path.parent.mkdir(parents=True, exist_ok=True)
     return TelegramClient(
-        str(session_path),
+        _WalSqliteSession(str(session_path)),
         config.telegram.api_id,
         config.telegram.api_hash,
     )

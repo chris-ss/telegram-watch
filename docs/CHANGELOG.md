@@ -4,6 +4,9 @@
 
 > Entries are arranged from newest to oldest so the latest release notes stay at the top. Each bullet references the requirement(s) that introduced the change.
 
+## 1.6.1 — 2026-03-21
+- Enable WAL mode and busy_timeout on all SQLite databases (app DB and Telethon session) for cloud-sync resilience. Add automatic retry on transient I/O errors, and warn in `doctor` when data files reside in cloud-synced directories (REQ-20260321-001-sqlite-wal-retry).
+
 ## 1.6.0 — 2026-03-20
 - [EXPERIMENTAL] Add real-time push mode: forward tracked messages to the control chat instantly on arrival, with a separate configurable interval for HTML report aggregation. Includes a 7-layer rate protection suite (sliding window, jittered delay, media throttle, hourly/daily caps, exponential backoff, circuit breaker with Bark alerts, and startup warmup) to prevent Telegram account restrictions (REQ-20260320-001-realtime-push-mode).
 
