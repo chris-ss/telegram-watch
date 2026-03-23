@@ -571,7 +571,7 @@ const _i18n = {
     onceWindowHelp: "示例：10m、2h、2026-02-01T10:30Z",
     onceTarget: "目标群组",
     allTargets: "全部目标",
-    onceTargetHelp: "选择单个目标，或保持"全部目标"。",
+    onceTargetHelp: "选择单个目标，或保持「全部目标」。",
     oncePush: "推送报告",
     pushToControl: "推送到控制群",
     oncePushHelp: "默认关闭；启用后将推送单次运行的报告。",
