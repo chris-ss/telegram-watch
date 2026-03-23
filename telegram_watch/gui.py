@@ -1427,7 +1427,7 @@ function render() {
               return options.join("");
             })()}
           </select>
-          <small>${t(“onceTargetHelp”)}</small>
+          <small>${t("onceTargetHelp")}</small>
         </div>
         <div class="field">
           <label>${t("oncePush")}</label>
