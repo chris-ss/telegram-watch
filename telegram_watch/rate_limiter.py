@@ -431,17 +431,15 @@ class RateProtectionSuite:
         self._sliding.record(now)
         self._jitter.record(now)
 
-    def record_flood_wait(self, wait_seconds: int) -> None:
+    def record_flood_wait(self, wait_seconds: int) -> float:
         """Record a FloodWait error from Telegram.
 
-        This updates the exponential back-off multiplier and may trip
-        the circuit breaker.  The caller is expected to ``asyncio.sleep``
-        for the value returned by the internal back-off layer; however,
-        the public contract only records the event — the caller should
-        sleep for at least ``wait_seconds`` on its own.
+        Returns the backoff-adjusted wait time (>= *wait_seconds*).
+        The caller should sleep for at least this long.
         """
-        self._backoff.compute_wait(wait_seconds)
+        adjusted = self._backoff.compute_wait(wait_seconds)
         self._breaker.record_flood()
+        return adjusted
 
     def is_circuit_broken(self) -> bool:
         """Return ``True`` if the circuit breaker is currently tripped."""

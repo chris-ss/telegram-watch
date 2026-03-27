@@ -774,7 +774,10 @@ class _RealtimePusher:
             except asyncio.CancelledError:
                 pass
 
+    _MAX_RETRIES = 3
+
     async def _run(self) -> None:
+        retry_counts: dict[int, int] = {}  # message_id -> attempts
         while not self._stop.is_set():
             try:
                 # Use a short timeout so we can check the stop flag periodically.
@@ -784,11 +787,29 @@ class _RealtimePusher:
                     )
                 except asyncio.TimeoutError:
                     continue
-                await self._push_message(db_msg, target)
+                try:
+                    await self._push_message(db_msg, target)
+                    retry_counts.pop(db_msg.message_id, None)
+                except errors.FloodWaitError:
+                    # Already handled inside _push_message (re-enqueued there).
+                    pass
+                except Exception:
+                    attempts = retry_counts.get(db_msg.message_id, 0) + 1
+                    if attempts < self._MAX_RETRIES:
+                        retry_counts[db_msg.message_id] = attempts
+                        logger.warning(
+                            "Realtime push failed for msg %s (attempt %d/%d); will retry.",
+                            db_msg.message_id, attempts, self._MAX_RETRIES,
+                        )
+                        self.queue.put_nowait((db_msg, target))
+                    else:
+                        retry_counts.pop(db_msg.message_id, None)
+                        logger.exception(
+                            "Realtime push failed for msg %s after %d attempts; dropping.",
+                            db_msg.message_id, self._MAX_RETRIES,
+                        )
             except asyncio.CancelledError:
                 break
-            except Exception:
-                logger.exception("Realtime pusher error; will continue.")
 
     async def _push_message(
         self, db_msg: DbMessage, target: TargetGroupConfig,
@@ -1714,7 +1735,7 @@ def _format_interval_label(minutes: int) -> str:
 async def _with_floodwait(
     func: Callable[..., Awaitable[T]],
     *args,
-    on_flood_wait: Callable[[int], None] | None = None,
+    on_flood_wait: Callable[[int], float] | None = None,
     **kwargs,
 ) -> T:
     while True:
@@ -1722,9 +1743,11 @@ async def _with_floodwait(
             return await func(*args, **kwargs)
         except errors.FloodWaitError as exc:
             wait_for = exc.seconds + 1
-            logger.warning("FloodWait: sleeping for %ss", wait_for)
             if on_flood_wait is not None:
-                on_flood_wait(exc.seconds)
+                adjusted = on_flood_wait(exc.seconds)
+                if isinstance(adjusted, (int, float)) and adjusted > wait_for:
+                    wait_for = adjusted
+            logger.warning("FloodWait: sleeping for %ss", wait_for)
             await asyncio.sleep(wait_for)
 
 
