@@ -816,6 +816,9 @@ class _RealtimePusher:
                             "Realtime push failed for msg %s:%s after %d attempts; dropping.",
                             db_msg.chat_id, db_msg.message_id, self._MAX_RETRIES,
                         )
+                # Safety: cap dict size to prevent unbounded growth.
+                if len(retry_counts) > 1000:
+                    retry_counts.clear()
             except asyncio.CancelledError:
                 break
 
@@ -904,12 +907,13 @@ class _RealtimePusher:
                     self.rate_protection.record_send()
         except errors.FloodWaitError as exc:
             # FloodWait that escaped _with_floodwait (should be rare).
-            self.rate_protection.record_flood_wait(exc.seconds)
+            adjusted = self.rate_protection.record_flood_wait(exc.seconds)
+            wait_for = max(exc.seconds + 1, adjusted)
             logger.warning(
                 "FloodWait during realtime push: sleeping %ds then retrying.",
-                exc.seconds,
+                wait_for,
             )
-            await asyncio.sleep(exc.seconds + 1)
+            await asyncio.sleep(wait_for)
             self.queue.put_nowait((db_msg, target))
 
 
@@ -1763,7 +1767,7 @@ async def _send_with_backoff(
     client: TelegramClient,
     entity: int | str,
     message: str,
-    on_flood_wait: Callable[[int], None] | None = None,
+    on_flood_wait: Callable[[int], float] | None = None,
     **kwargs,
 ) -> None:
     target = await _resolve_entity(client, entity)
@@ -1774,7 +1778,7 @@ async def _send_file_with_backoff(
     client: TelegramClient,
     entity: int | str,
     file_path: Path,
-    on_flood_wait: Callable[[int], None] | None = None,
+    on_flood_wait: Callable[[int], float] | None = None,
     **kwargs,
 ) -> None:
     target = await _resolve_entity(client, entity)
@@ -1786,7 +1790,7 @@ async def _send_message_with_fallback(
     fallback_client: TelegramClient | None,
     entity: int | str,
     message: str,
-    on_flood_wait: Callable[[int], None] | None = None,
+    on_flood_wait: Callable[[int], float] | None = None,
     **kwargs,
 ) -> None:
     try:
@@ -1804,7 +1808,7 @@ async def _send_file_with_fallback(
     fallback_client: TelegramClient | None,
     entity: int | str,
     file_path: Path,
-    on_flood_wait: Callable[[int], None] | None = None,
+    on_flood_wait: Callable[[int], float] | None = None,
     **kwargs,
 ) -> None:
     try:
