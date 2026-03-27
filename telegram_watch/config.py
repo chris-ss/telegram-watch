@@ -622,6 +622,11 @@ def _parse_realtime(raw: dict[str, Any]) -> RealtimeConfig:
             "Realtime push mode is EXPERIMENTAL — behavior and config keys may change in future releases.",
             stacklevel=2,
         )
+        warnings.filterwarnings(
+            "ignore",
+            message="Realtime push mode is EXPERIMENTAL",
+            category=UserWarning,
+        )
 
     report_interval = _require_int(
         raw.get("report_interval_minutes", 120),
