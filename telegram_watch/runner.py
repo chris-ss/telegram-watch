@@ -818,6 +818,8 @@ class _RealtimePusher:
                 )
                 await asyncio.sleep(exc.remaining_seconds)
 
+        flood_cb = self.rate_protection.record_flood_wait
+
         try:
             reply_to = _topic_reply_id_for_message(
                 control, target.target_chat_id, db_msg,
@@ -828,27 +830,57 @@ class _RealtimePusher:
                 self._fallback_client,
                 control.control_chat_id,
                 text,
+                on_flood_wait=flood_cb,
                 parse_mode="html",
                 reply_to=reply_to,
             )
-            await _send_media_for_message(
-                self.client,
-                control.control_chat_id,
-                db_msg,
-                self.config,
-                target,
-                reply_to=reply_to,
-                fallback_client=self._fallback_client,
-            )
             self.rate_protection.record_send()
+
+            # Each media attachment is a separate Telegram API call —
+            # account for it individually in rate windows.
+            if db_msg.media:
+                for media in db_msg.media:
+                    file_path = Path(media.file_path)
+                    if not file_path.exists():
+                        logger.warning("Media file missing on disk: %s", file_path)
+                        continue
+                    sender_label = self.config.format_user_label(
+                        db_msg.sender_id, target=target,
+                    )
+                    if media.is_reply:
+                        reply_label = (
+                            self.config.format_user_label(
+                                db_msg.replied_sender_id, target=target,
+                            )
+                            if db_msg.replied_sender_id
+                            else "unknown"
+                        )
+                        caption = (
+                            f"Reply media for message #{db_msg.message_id}\n"
+                            f"Original sender: {reply_label}"
+                        )
+                    else:
+                        caption = f"Media for {sender_label} — message #{db_msg.message_id}"
+
+                    await self.rate_protection.acquire(has_media=True)
+                    await _send_file_with_fallback(
+                        self.client,
+                        self._fallback_client,
+                        control.control_chat_id,
+                        file_path,
+                        on_flood_wait=flood_cb,
+                        caption=caption,
+                        reply_to=reply_to,
+                    )
+                    self.rate_protection.record_send()
         except errors.FloodWaitError as exc:
+            # FloodWait that escaped _with_floodwait (should be rare).
             self.rate_protection.record_flood_wait(exc.seconds)
             logger.warning(
                 "FloodWait during realtime push: sleeping %ds then retrying.",
                 exc.seconds,
             )
             await asyncio.sleep(exc.seconds + 1)
-            # Re-enqueue for retry.
             self.queue.put_nowait((db_msg, target))
 
 
@@ -1682,6 +1714,7 @@ def _format_interval_label(minutes: int) -> str:
 async def _with_floodwait(
     func: Callable[..., Awaitable[T]],
     *args,
+    on_flood_wait: Callable[[int], None] | None = None,
     **kwargs,
 ) -> T:
     while True:
@@ -1690,6 +1723,8 @@ async def _with_floodwait(
         except errors.FloodWaitError as exc:
             wait_for = exc.seconds + 1
             logger.warning("FloodWait: sleeping for %ss", wait_for)
+            if on_flood_wait is not None:
+                on_flood_wait(exc.seconds)
             await asyncio.sleep(wait_for)
 
 
@@ -1697,20 +1732,22 @@ async def _send_with_backoff(
     client: TelegramClient,
     entity: int | str,
     message: str,
+    on_flood_wait: Callable[[int], None] | None = None,
     **kwargs,
 ) -> None:
     target = await _resolve_entity(client, entity)
-    await _with_floodwait(client.send_message, target, message, **kwargs)
+    await _with_floodwait(client.send_message, target, message, on_flood_wait=on_flood_wait, **kwargs)
 
 
 async def _send_file_with_backoff(
     client: TelegramClient,
     entity: int | str,
     file_path: Path,
+    on_flood_wait: Callable[[int], None] | None = None,
     **kwargs,
 ) -> None:
     target = await _resolve_entity(client, entity)
-    await _with_floodwait(client.send_file, target, file=file_path, **kwargs)
+    await _with_floodwait(client.send_file, target, file=file_path, on_flood_wait=on_flood_wait, **kwargs)
 
 
 async def _send_message_with_fallback(
@@ -1718,16 +1755,17 @@ async def _send_message_with_fallback(
     fallback_client: TelegramClient | None,
     entity: int | str,
     message: str,
+    on_flood_wait: Callable[[int], None] | None = None,
     **kwargs,
 ) -> None:
     try:
-        await _send_with_backoff(client, entity, message, **kwargs)
+        await _send_with_backoff(client, entity, message, on_flood_wait=on_flood_wait, **kwargs)
         return
     except Exception as exc:
         if fallback_client is None or fallback_client is client:
             raise
         logger.warning("Sender failed to send message; retrying with primary: %s", exc)
-    await _send_with_backoff(fallback_client, entity, message, **kwargs)
+    await _send_with_backoff(fallback_client, entity, message, on_flood_wait=on_flood_wait, **kwargs)
 
 
 async def _send_file_with_fallback(
@@ -1735,16 +1773,17 @@ async def _send_file_with_fallback(
     fallback_client: TelegramClient | None,
     entity: int | str,
     file_path: Path,
+    on_flood_wait: Callable[[int], None] | None = None,
     **kwargs,
 ) -> None:
     try:
-        await _send_file_with_backoff(client, entity, file_path, **kwargs)
+        await _send_file_with_backoff(client, entity, file_path, on_flood_wait=on_flood_wait, **kwargs)
         return
     except Exception as exc:
         if fallback_client is None or fallback_client is client:
             raise
         logger.warning("Sender failed to send file; retrying with primary: %s", exc)
-    await _send_file_with_backoff(fallback_client, entity, file_path, **kwargs)
+    await _send_file_with_backoff(fallback_client, entity, file_path, on_flood_wait=on_flood_wait, **kwargs)
 
 
 async def _resolve_entity(
