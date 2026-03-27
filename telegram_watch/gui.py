@@ -576,6 +576,41 @@ const _i18n = {
     customTimezone: "Custom (keep existing) - {tz}",
     limitsText: "Limits: {targets} groups, {users} users per group, {controls} control groups.",
     select: "Select",
+    realtimeBannerTitle: "Realtime mode (EXPERIMENTAL) is active",
+    realtimeBannerDesc: "Messages are forwarded instantly. Rate limits: {perMin}/min, {perHr}/hr, {perDay}/day. Account restrictions are possible — monitor for FloodWait errors.",
+    cloudSyncBannerTitle: "Your data files are inside a cloud sync directory",
+    cloudSyncBannerDesc: "Cloud sync services can occasionally lock SQLite files, which may cause transient errors. WAL mode is enabled by default since v1.6.1 to mitigate this, but for maximum reliability consider moving data files outside the sync folder.",
+    realtimeSectionTitle: "Realtime Push Mode — EXPERIMENTAL",
+    realtimeSectionDesc: "Forward messages instantly instead of on a scheduled interval. Use with caution.",
+    pushMode: "Push Mode",
+    pushModeInterval: "Interval",
+    pushModeRealtime: "Realtime (Experimental)",
+    intervalModeStatus: "Using scheduled interval mode. Messages are batched into periodic summary reports.",
+    realtimeWarningTitle: "Warning: You are enabling Realtime Push Mode",
+    realtimeWarnExperimental: "This feature is <strong>experimental</strong> and behavior may change in future releases.",
+    realtimeWarnRestrictions: "Sending messages too frequently risks <strong>Telegram account restrictions</strong> (temporary or permanent bans).",
+    realtimeWarnRateProtection: "7-layer rate protection is enabled by default, but aggressive limits can still trigger FloodWait errors.",
+    realtimeWarnDefaults: "Default limits: <strong>20 msgs/min</strong>, <strong>200 msgs/hr</strong>, <strong>1000 msgs/day</strong>.",
+    realtimeWarnCircuitBreaker: "The circuit breaker will automatically pause sending if too many FloodWait errors are received.",
+    realtimeWarnResponsibility: "You are responsible for monitoring logs and adjusting limits as needed.",
+    realtimeRiskConfirm: "I understand the risks and want to enable realtime mode",
+    confirmRealtimeMode: "Confirm Realtime Mode",
+    rateLimitMinute: "Rate Limit / Minute",
+    rateLimitMinuteHelp: "Max messages per minute (1\u201330)",
+    rateLimitHour: "Rate Limit / Hour",
+    rateLimitHourHelp: "Max messages per hour",
+    rateLimitDay: "Rate Limit / Day",
+    rateLimitDayHelp: "Max messages per day",
+    minIntervalSec: "Min Interval (sec)",
+    minIntervalSecHelp: "Minimum seconds between sends",
+    mediaExtraDelay: "Media Extra Delay (sec)",
+    mediaExtraDelayHelp: "Extra delay for media messages",
+    warmupMinutes: "Warmup Minutes",
+    warmupMinutesHelp: "Gradual ramp-up period after start",
+    warmupRate: "Warmup Rate",
+    warmupRateHelp: "Max msgs/min during warmup",
+    rtReportInterval: "Report Interval (min)",
+    rtReportIntervalHelp: "How often to send periodic summary reports",
   },
   zh: {
     badge: "本地配置器",
@@ -695,6 +730,41 @@ const _i18n = {
     customTimezone: "自定义（保持现有）- {tz}",
     limitsText: "限制：{targets} 个群组，每组 {users} 个用户，{controls} 个控制群组。",
     select: "选择",
+    realtimeBannerTitle: "实时推送模式（实验性）已启用",
+    realtimeBannerDesc: "消息将即时转发。速率限制：{perMin}/分钟、{perHr}/小时、{perDay}/天。可能触发账号限制——请关注 FloodWait 错误。",
+    cloudSyncBannerTitle: "数据文件位于云同步目录中",
+    cloudSyncBannerDesc: "云同步服务可能会偶尔锁定 SQLite 文件，从而导致临时错误。自 v1.6.1 起默认启用 WAL 模式以缓解此问题，但为获得最佳可靠性，建议将数据文件移出同步文件夹。",
+    realtimeSectionTitle: "实时推送模式 — 实验性",
+    realtimeSectionDesc: "即时转发消息，而非按计划周期汇总。请谨慎使用。",
+    pushMode: "推送模式",
+    pushModeInterval: "定时汇总",
+    pushModeRealtime: "实时推送（实验性）",
+    intervalModeStatus: "当前使用定时汇总模式。消息将按周期批量汇总后推送。",
+    realtimeWarningTitle: "警告：您正在启用实时推送模式",
+    realtimeWarnExperimental: "此功能为<strong>实验性</strong>，后续版本中行为可能发生变化。",
+    realtimeWarnRestrictions: "发送消息过于频繁可能导致 <strong>Telegram 账号被限制</strong>（临时或永久封禁）。",
+    realtimeWarnRateProtection: "默认启用 7 层速率保护，但过于激进的限制仍可能触发 FloodWait 错误。",
+    realtimeWarnDefaults: "默认限制：<strong>20 条/分钟</strong>、<strong>200 条/小时</strong>、<strong>1000 条/天</strong>。",
+    realtimeWarnCircuitBreaker: "熔断器会在收到过多 FloodWait 错误时自动暂停发送。",
+    realtimeWarnResponsibility: "您有责任监控日志并根据需要调整限制。",
+    realtimeRiskConfirm: "我了解相关风险并希望启用实时推送模式",
+    confirmRealtimeMode: "确认启用实时模式",
+    rateLimitMinute: "每分钟速率限制",
+    rateLimitMinuteHelp: "每分钟最大消息数（1–30）",
+    rateLimitHour: "每小时速率限制",
+    rateLimitHourHelp: "每小时最大消息数",
+    rateLimitDay: "每日速率限制",
+    rateLimitDayHelp: "每天最大消息数",
+    minIntervalSec: "最小发送间隔（秒）",
+    minIntervalSecHelp: "两次发送之间的最短间隔",
+    mediaExtraDelay: "媒体额外延迟（秒）",
+    mediaExtraDelayHelp: "媒体消息的额外延迟",
+    warmupMinutes: "预热时长（分钟）",
+    warmupMinutesHelp: "启动后的逐步提速阶段",
+    warmupRate: "预热速率",
+    warmupRateHelp: "预热期间每分钟最大消息数",
+    rtReportInterval: "汇报间隔（分钟）",
+    rtReportIntervalHelp: "定期发送汇总报告的频率",
   }
 };
 
@@ -1395,14 +1465,14 @@ function render() {
     : "";
   const realtimeBanner = data.realtime && data.realtime.push_mode === "realtime" && state.realtimeConfirmed
     ? `<div class="warning-banner">
-        \\u26A0\\uFE0F Realtime mode (EXPERIMENTAL) is active
-        <p>Messages are forwarded instantly. Rate limits: ${data.realtime.rate_limit_per_minute}/min, ${data.realtime.rate_limit_per_hour}/hr, ${data.realtime.rate_limit_per_day}/day. Account restrictions are possible &mdash; monitor for FloodWait errors.</p>
+        \\u26A0\\uFE0F ${t("realtimeBannerTitle")}
+        <p>${tf("realtimeBannerDesc", {perMin: data.realtime.rate_limit_per_minute, perHr: data.realtime.rate_limit_per_hour, perDay: data.realtime.rate_limit_per_day})}</p>
       </div>`
     : "";
   const cloudSyncBanner = data.cloud_sync_warning
     ? `<div class="warning-banner">
-        \\u26A0\\uFE0F Your data files are inside a cloud sync directory (${data.cloud_sync_warning})
-        <p>Cloud sync services can occasionally lock SQLite files, which may cause transient errors. WAL mode is enabled by default since v1.6.1 to mitigate this, but for maximum reliability consider moving data files outside the sync folder.</p>
+        \\u26A0\\uFE0F ${t("cloudSyncBannerTitle")} (${data.cloud_sync_warning})
+        <p>${t("cloudSyncBannerDesc")}</p>
       </div>`
     : "";
 
@@ -1717,67 +1787,67 @@ function render() {
     </section>
 
     <section class="section">
-      <h2>Realtime Push Mode &mdash; EXPERIMENTAL</h2>
-      <p>Forward messages instantly instead of on a scheduled interval. Use with caution.</p>
+      <h2>${t("realtimeSectionTitle")}</h2>
+      <p>${t("realtimeSectionDesc")}</p>
       <div class="grid">
         <div class="field">
-          <label>Push Mode</label>
+          <label>${t("pushMode")}</label>
           <select id="realtime-push-mode" data-field="realtime.push_mode">
-            <option value="interval" ${data.realtime.push_mode !== "realtime" ? "selected" : ""}>Interval</option>
-            <option value="realtime" ${data.realtime.push_mode === "realtime" ? "selected" : ""}>Realtime (Experimental)</option>
+            <option value="interval" ${data.realtime.push_mode !== "realtime" ? "selected" : ""}>${t("pushModeInterval")}</option>
+            <option value="realtime" ${data.realtime.push_mode === "realtime" ? "selected" : ""}>${t("pushModeRealtime")}</option>
           </select>
         </div>
       </div>
       ${(() => {
         if (data.realtime.push_mode !== "realtime" && !state.realtimeConfirmed) {
-          return '<div class="status" style="margin-top:12px;">Using scheduled interval mode. Messages are batched into periodic summary reports.</div>';
+          return '<div class="status" style="margin-top:12px;">' + t("intervalModeStatus") + '</div>';
         }
         if (data.realtime.push_mode === "realtime" && !state.realtimeConfirmed) {
           return '<div class="notice" style="margin-top:12px;">'
-            + '<strong>Warning: You are enabling Realtime Push Mode</strong>'
+            + '<strong>' + t("realtimeWarningTitle") + '</strong>'
             + '<ul style="margin:8px 0 8px 16px;padding:0;font-size:13px;color:#7a4a1a;">'
-            + '<li>This feature is <strong>experimental</strong> and behavior may change in future releases.</li>'
-            + '<li>Sending messages too frequently risks <strong>Telegram account restrictions</strong> (temporary or permanent bans).</li>'
-            + '<li>7-layer rate protection is enabled by default, but aggressive limits can still trigger FloodWait errors.</li>'
-            + '<li>Default limits: <strong>20 msgs/min</strong>, <strong>200 msgs/hr</strong>, <strong>1000 msgs/day</strong>.</li>'
-            + '<li>The circuit breaker will automatically pause sending if too many FloodWait errors are received.</li>'
-            + '<li>You are responsible for monitoring logs and adjusting limits as needed.</li>'
+            + '<li>' + t("realtimeWarnExperimental") + '</li>'
+            + '<li>' + t("realtimeWarnRestrictions") + '</li>'
+            + '<li>' + t("realtimeWarnRateProtection") + '</li>'
+            + '<li>' + t("realtimeWarnDefaults") + '</li>'
+            + '<li>' + t("realtimeWarnCircuitBreaker") + '</li>'
+            + '<li>' + t("realtimeWarnResponsibility") + '</li>'
             + '</ul>'
             + '<label class="checkbox">'
             + '<input type="checkbox" id="realtime-risk-confirm" />'
-            + 'I understand the risks and want to enable realtime mode'
+            + t("realtimeRiskConfirm")
             + '</label>'
             + '<div class="actions" style="margin-top:10px;">'
-            + '<button class="button secondary" data-action="realtime-confirm" disabled>Confirm Realtime Mode</button>'
-            + '<button class="button secondary" data-action="realtime-cancel">Cancel</button>'
+            + '<button class="button secondary" data-action="realtime-confirm" disabled>' + t("confirmRealtimeMode") + '</button>'
+            + '<button class="button secondary" data-action="realtime-cancel">' + t("cancel") + '</button>'
             + '</div>'
             + '</div>';
         }
         return '<div class="grid" style="margin-top:16px;">'
-          + '<div class="field"><label>Rate Limit / Minute</label>'
+          + '<div class="field"><label>' + t("rateLimitMinute") + '</label>'
           + '<input data-field="realtime.rate_limit_per_minute" value="' + data.realtime.rate_limit_per_minute + '" placeholder="20" />'
-          + '<small>Max messages per minute (1\u201330)</small></div>'
-          + '<div class="field"><label>Rate Limit / Hour</label>'
+          + '<small>' + t("rateLimitMinuteHelp") + '</small></div>'
+          + '<div class="field"><label>' + t("rateLimitHour") + '</label>'
           + '<input data-field="realtime.rate_limit_per_hour" value="' + data.realtime.rate_limit_per_hour + '" placeholder="200" />'
-          + '<small>Max messages per hour</small></div>'
-          + '<div class="field"><label>Rate Limit / Day</label>'
+          + '<small>' + t("rateLimitHourHelp") + '</small></div>'
+          + '<div class="field"><label>' + t("rateLimitDay") + '</label>'
           + '<input data-field="realtime.rate_limit_per_day" value="' + data.realtime.rate_limit_per_day + '" placeholder="1000" />'
-          + '<small>Max messages per day</small></div>'
-          + '<div class="field"><label>Min Interval (sec)</label>'
+          + '<small>' + t("rateLimitDayHelp") + '</small></div>'
+          + '<div class="field"><label>' + t("minIntervalSec") + '</label>'
           + '<input data-field="realtime.min_interval_sec" value="' + data.realtime.min_interval_sec + '" placeholder="3.0" />'
-          + '<small>Minimum seconds between sends</small></div>'
-          + '<div class="field"><label>Media Extra Delay (sec)</label>'
+          + '<small>' + t("minIntervalSecHelp") + '</small></div>'
+          + '<div class="field"><label>' + t("mediaExtraDelay") + '</label>'
           + '<input data-field="realtime.media_extra_delay_sec" value="' + data.realtime.media_extra_delay_sec + '" placeholder="2.0" />'
-          + '<small>Extra delay for media messages</small></div>'
-          + '<div class="field"><label>Warmup Minutes</label>'
+          + '<small>' + t("mediaExtraDelayHelp") + '</small></div>'
+          + '<div class="field"><label>' + t("warmupMinutes") + '</label>'
           + '<input data-field="realtime.warmup_minutes" value="' + data.realtime.warmup_minutes + '" placeholder="5.0" />'
-          + '<small>Gradual ramp-up period after start</small></div>'
-          + '<div class="field"><label>Warmup Rate</label>'
+          + '<small>' + t("warmupMinutesHelp") + '</small></div>'
+          + '<div class="field"><label>' + t("warmupRate") + '</label>'
           + '<input data-field="realtime.warmup_rate" value="' + data.realtime.warmup_rate + '" placeholder="5" />'
-          + '<small>Max msgs/min during warmup</small></div>'
-          + '<div class="field"><label>Report Interval (min)</label>'
+          + '<small>' + t("warmupRateHelp") + '</small></div>'
+          + '<div class="field"><label>' + t("rtReportInterval") + '</label>'
           + '<input data-field="realtime.report_interval_minutes" value="' + data.realtime.report_interval_minutes + '" placeholder="120" />'
-          + '<small>How often to send periodic summary reports</small></div>'
+          + '<small>' + t("rtReportIntervalHelp") + '</small></div>'
           + '</div>';
       })()}
     </section>
