@@ -27,14 +27,9 @@ class UpdateInfo:
 
 
 def get_current_version() -> str:
-    """Read version from package metadata or pyproject.toml."""
-    # Try importlib.metadata first (works when package is installed).
-    try:
-        from importlib.metadata import version
-        return version("telegram-watch")
-    except Exception:
-        pass
-    # Fallback: read pyproject.toml relative to this file.
+    """Read version from pyproject.toml (real-time) or package metadata."""
+    # Prefer pyproject.toml — always reflects the current source version,
+    # even if the package was installed with an older version via pip.
     try:
         pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
         if pyproject.exists():
@@ -42,9 +37,16 @@ def get_current_version() -> str:
             for line in text.splitlines():
                 stripped = line.strip()
                 if stripped.startswith("version"):
-                    # Parse  version = "x.y.z"
                     _, _, val = stripped.partition("=")
-                    return val.strip().strip('"').strip("'")
+                    v = val.strip().strip('"').strip("'")
+                    if v:
+                        return v
+    except Exception:
+        pass
+    # Fallback: importlib.metadata (works in installed/frozen environments).
+    try:
+        from importlib.metadata import version
+        return version("telegram-watch")
     except Exception:
         pass
     return "0.0.0"
