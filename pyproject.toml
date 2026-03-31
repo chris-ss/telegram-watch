@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "telegram-watch"
-version = "1.6.1"
+dynamic = ["version"]
 description = "Telegram user account watcher (MTProto)"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -24,6 +24,9 @@ dev = [
 
 [project.scripts]
 tgwatch = "telegram_watch.cli:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "telegram_watch.__version__"}
 
 [tool.setuptools.packages.find]
 include = ["telegram_watch*", "tgwatch*"]
