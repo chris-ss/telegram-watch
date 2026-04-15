@@ -45,7 +45,7 @@
 
 ## Todoist workflow (single source of truth for tasks)
 
-本项目使用 Todoist 的 `telegram-watch` 项目（Board 视图）作为**唯一**的任务来源。每次开发活动必须与 Todoist 保持同步。旧的 `docs/requests/**` REQ 文件仅作为历史参考保留，不再创建新文件。
+本项目使用 Todoist 共享的 `Dev` 项目（Board 视图）+ `telegram-watch` 标签作为**唯一**的任务来源。`Dev` 项目由多个子项目共用（CodexBar、telegram-watch 等），各自用**不同的标签**区分；栏位（Backlog / In Progress / Code Complete / QA / Release）共用一套。每次开发活动必须与 Todoist 保持同步。旧的 `docs/requests/**` REQ 文件仅作为历史参考保留，不再创建新文件。
 
 ### 看板栏目
 
@@ -61,8 +61,9 @@
 
 - **唯一项目标签**：`telegram-watch`。所有本项目任务必须打上，且只打这一个。
 - **不**新建 `Bug` / `商业化` 等分类标签。
-- **不**改动其他项目已有的标签/项目（例如 `CodexBar-Mobile`、`Dev` 项目），每次调用 Todoist MCP 必须显式指定项目 id。
-- 创建标签/项目前先 `find-labels` / `find-projects`，已存在则复用。
+- **不**新建独立的 Todoist 项目（例如 `telegram-watch` 项目）；本项目寄生在共享的 `Dev` 项目里，靠标签区分。
+- **不**改动其他子项目已有的标签（例如 `CodexBar-Mobile`、`Telegram-Watch-Mac`），每次调用 Todoist MCP 必须显式带 `telegram-watch` 标签过滤，避免误动其他子项目的任务。
+- 创建标签前先 `find-labels`，已存在则复用。
 
 ### 任务创建规范
 
@@ -160,13 +161,13 @@ comment 正文：
 
 | User Input | Action |
 |------------|--------|
-| `/start-working` | TL reads `plan.md`, checks Todoist `telegram-watch` 项目 In Progress / Backlog 栏, proposes today's work |
+| `/start-working` | TL reads `plan.md`, checks Todoist `Dev` 项目中带 `telegram-watch` 标签的 In Progress / Backlog 任务, proposes today's work |
 | `/end-working` | TL summarizes session, updates `plan.md`, lists uncommitted changes, mirrors state to Todoist comments |
-| `/plan` | TL produces or updates `plan.md` based on Todoist Backlog / In Progress and current state |
+| `/plan` | TL produces or updates `plan.md` based on Todoist Backlog / In Progress（`telegram-watch` 标签过滤）and current state |
 | `/init-project` | Setup Assistant scaffolds a new project |
 | `/migrate` | Setup Assistant migrates existing project to iSparto workflow |
 | `/env-nogo` | Setup Assistant verifies environment readiness |
-| New feature request | Create a Todoist task in `telegram-watch` 项目 Backlog（详见 Todoist workflow 章节） |
+| New feature request | Create a Todoist task in `Dev` 项目 Backlog 栏，labels=`["telegram-watch"]`（详见 Todoist workflow 章节） |
 
 ### Branching Strategy
 
