@@ -72,11 +72,15 @@ class ReportingConfig:
     retention_days: int
 
 
+VALID_DISPLAY_TEMPLATES = ("normal", "minimal")
+
+
 @dataclass(frozen=True)
 class DisplayConfig:
     show_ids: bool
     time_format: str
     language: str  # "auto" | "zh" | "en"
+    template: str = "normal"  # "normal" | "minimal"
 
 
 @dataclass(frozen=True)
@@ -617,7 +621,17 @@ def _parse_display(raw: dict[str, Any]) -> DisplayConfig:
         raise ConfigError(
             f"display.language must be one of 'auto', 'zh', 'en', got '{language}'"
         )
-    return DisplayConfig(show_ids=show_ids, time_format=fmt, language=language)
+    template = str(raw.get("template", "normal")).strip().lower()
+    if template not in VALID_DISPLAY_TEMPLATES:
+        raise ConfigError(
+            f"display.template must be one of {VALID_DISPLAY_TEMPLATES!r}, got '{template}'"
+        )
+    return DisplayConfig(
+        show_ids=show_ids,
+        time_format=fmt,
+        language=language,
+        template=template,
+    )
 
 
 def _parse_notifications(raw: dict[str, Any]) -> NotificationConfig:

@@ -1646,6 +1646,21 @@ async def _send_media_for_message(
         )
 
 
+def _format_head_normal(label_html: str, time_line: str, body_html: str) -> list[str]:
+    return [
+        label_html,
+        time_line,
+        f"<b>Content:</b> {body_html}",
+    ]
+
+
+def _format_head_minimal(label_html: str, time_line: str, body_html: str) -> list[str]:
+    return [
+        f"{label_html}: {body_html}",
+        time_line,
+    ]
+
+
 def _format_control_message(
     message: DbMessage,
     config: Config,
@@ -1659,13 +1674,13 @@ def _format_control_message(
         msg_label = f"<a href=\"{escape(msg_link)}\">{escape(msg_label_text)}</a>"
     else:
         msg_label = escape(msg_label_text)
-    lines = [
-        f"<b>{escape(label)}</b>",
-        f"Time: {escape(local_ts)} — {msg_label}",
-    ]
-    body_text = escape(message.text) if message.text else "<i>no text</i>"
-    lines.append(f"<b>Content:</b> {body_text}")
-    quote_blocks: list[str] = []
+    label_html = f"<b>{escape(label)}</b>"
+    time_line = f"Time: {escape(local_ts)} — {msg_label}"
+    body_html = escape(message.text) if message.text else "<i>no text</i>"
+    if config.display.template == "minimal":
+        lines = _format_head_minimal(label_html, time_line, body_html)
+    else:
+        lines = _format_head_normal(label_html, time_line, body_html)
     regular_media = sum(1 for media in message.media if not media.is_reply)
     reply_media = sum(1 for media in message.media if media.is_reply)
     if regular_media:
@@ -1679,9 +1694,8 @@ def _format_control_message(
             reply_line += f" at {escape(_format_timestamp_local(message.replied_date, config))}"
         raw_reply_text = (message.replied_text or "").lstrip("\n\r")
         reply_text = escape(raw_reply_text) if raw_reply_text else "<i>no text</i>"
-        quote_blocks.append(f"<blockquote>{reply_line}</blockquote>")
-        quote_blocks.append(f"<blockquote>{reply_text}</blockquote>")
-    lines.extend(quote_blocks)
+        lines.append(f"<blockquote>{reply_line}</blockquote>")
+        lines.append(f"<blockquote>{reply_text}</blockquote>")
     return "\n".join(lines)
 
 
