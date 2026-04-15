@@ -361,3 +361,151 @@ def test_render_toml_quotes_control_group_key() -> None:
     assert '[control_groups."main group"]' in toml_text
     assert parsed["control_groups"]["main group"]["control_chat_id"] == -2001
     assert parsed["control_groups"]["main group"]["topic_target_map"]["-1001"]["123"] == 9001
+
+
+def test_normalize_config_display_template_default_when_missing() -> None:
+    data = _normalize_config({})
+    assert data["display"]["template"] == "normal"
+
+
+def test_normalize_config_display_template_preserved() -> None:
+    data = _normalize_config({"display": {"template": "minimal"}})
+    assert data["display"]["template"] == "minimal"
+
+
+def _minimal_valid_payload() -> dict:
+    return {
+        "telegram": {"api_id": "42", "api_hash": "abcdefghijk", "session_file": "data/tgwatch.session"},
+        "sender": {"enabled": False, "session_file": ""},
+        "targets": [
+            {
+                "name": "group-1",
+                "target_chat_id": "-1001",
+                "summary_interval_minutes": "",
+                "control_group": "default",
+                "tracked_users": [{"id": "123", "alias": ""}],
+            }
+        ],
+        "control_groups": [
+            {
+                "key": "default",
+                "control_chat_id": "-2001",
+                "is_forum": False,
+                "topic_routing_enabled": False,
+                "topic_target_map": [],
+            }
+        ],
+        "storage": {"db_path": "data/tgwatch.sqlite3", "media_dir": "data/media"},
+        "reporting": {
+            "reports_dir": "reports",
+            "summary_interval_minutes": "120",
+            "timezone": "UTC",
+            "retention_days": "30",
+        },
+        "display": {"show_ids": True, "time_format": "%Y.%m.%d %H:%M:%S (%Z)", "language": "auto"},
+        "notifications": {"bark_key": ""},
+    }
+
+
+def test_validate_payload_accepts_normal_and_minimal_templates() -> None:
+    payload = _minimal_valid_payload()
+    payload["display"]["template"] = "minimal"
+    errors, normalized = _validate_payload(payload, {})
+    assert not errors
+    assert normalized["display"]["template"] == "minimal"
+
+    payload["display"]["template"] = "normal"
+    errors, normalized = _validate_payload(payload, {})
+    assert not errors
+    assert normalized["display"]["template"] == "normal"
+
+
+def test_validate_payload_unknown_template_falls_back_to_normal() -> None:
+    payload = _minimal_valid_payload()
+    payload["display"]["template"] = "fancy"
+    errors, normalized = _validate_payload(payload, {})
+    assert not errors  # unknown value is coerced to default, not an error
+    assert normalized["display"]["template"] == "normal"
+
+
+def test_validate_payload_missing_template_defaults_to_normal() -> None:
+    payload = _minimal_valid_payload()
+    assert "template" not in payload["display"]
+    errors, normalized = _validate_payload(payload, {})
+    assert not errors
+    assert normalized["display"]["template"] == "normal"
+
+
+def test_render_toml_writes_display_template() -> None:
+    normalized = {
+        "config_version": 1.0,
+        "telegram": {"api_id": 42, "api_hash": "abcdefghijk", "session_file": "data/tgwatch.session"},
+        "sender": {"enabled": False, "session_file": ""},
+        "targets": [
+            {
+                "name": "group-1",
+                "target_chat_id": -1001,
+                "tracked_user_ids": [123],
+                "tracked_user_aliases": {},
+                "summary_interval_minutes": None,
+                "control_group": "default",
+            }
+        ],
+        "control_groups": [
+            {
+                "key": "default",
+                "control_chat_id": -2001,
+                "is_forum": False,
+                "topic_routing_enabled": False,
+                "skip_html_report": False,
+                "topic_target_map": [],
+            }
+        ],
+        "storage": {"db_path": "data/db", "media_dir": "data/media"},
+        "reporting": {"reports_dir": "reports", "summary_interval_minutes": 120, "timezone": "UTC", "retention_days": 30},
+        "display": {
+            "show_ids": True,
+            "time_format": "%Y.%m.%d %H:%M:%S (%Z)",
+            "language": "auto",
+            "template": "minimal",
+        },
+        "notifications": {"bark_key": "", "heartbeat_interval_hours": 2, "check_updates": True},
+    }
+
+    toml_text = _render_toml(normalized, {})
+    assert 'template = "minimal"' in toml_text
+
+    parsed = tomllib.loads(toml_text)
+    assert parsed["display"]["template"] == "minimal"
+
+
+def test_gui_i18n_dict_contains_template_keys_both_languages() -> None:
+    # Parse the JS _i18n object from gui.py and verify both locales have the new keys.
+    from telegram_watch import gui as gui_mod
+    import re
+
+    source = Path(gui_mod.__file__).read_text(encoding="utf-8")
+    # Extract the substring from `const _i18n = {` to the matching closing `};` (naive but enough).
+    start = source.index("const _i18n = {")
+    # Find end: the block ends with `};` followed by a newline and the _tzLabels block.
+    end = source.index("// Timezone label translations", start)
+    block = source[start:end]
+
+    required_keys = [
+        "messageTemplateSection",
+        "messageTemplateHelp",
+        "template:",
+        "templateNormal",
+        "templateMinimal",
+        "templateNormalDesc",
+        "templateMinimalDesc",
+        "templatePreview",
+        "messageFieldsSection",
+        "languageSection",
+        "notificationsSection",
+    ]
+    for key in required_keys:
+        # Each key should appear at least twice (once in en, once in zh).
+        key_literal = key.rstrip(":") + ":"
+        occurrences = len(re.findall(r"\b" + re.escape(key_literal), block))
+        assert occurrences >= 2, f"i18n key {key_literal!r} missing from zh or en ({occurrences} occurrences)"

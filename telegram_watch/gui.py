@@ -24,6 +24,7 @@ from .config import (
     MAX_CONTROL_GROUPS,
     MAX_TARGET_GROUPS,
     MAX_USERS_PER_TARGET,
+    VALID_DISPLAY_TEMPLATES,
     load_config,
 )
 from .migration import migrate_config
@@ -619,6 +620,17 @@ const _i18n = {
     heartbeatIntervalHelp: "Send 'still running' message after this many hours of inactivity. 0 = disabled, max 24.",
     checkUpdates: "Check for Updates",
     checkUpdatesHelp: "Automatically check GitHub for new releases every 24 hours.",
+    messageTemplateSection: "Message Template",
+    messageTemplateHelp: "Choose the layout for individual messages forwarded to the control chat. Applies in both interval mode (per-message forwards after each digest) and realtime mode (instant push). ID display, time format, and language preferences still apply on top of the chosen template.",
+    template: "Template",
+    templateNormal: "Normal",
+    templateMinimal: "Minimal",
+    templateNormalDesc: "Sender, time, and content on separate lines (default).",
+    templateMinimalDesc: "Sender and content on one line; time on the second line.",
+    templatePreview: "Preview",
+    messageFieldsSection: "Message Fields",
+    languageSection: "Language",
+    notificationsSection: "Notifications",
   },
   zh: {
     badge: "本地配置器",
@@ -781,6 +793,17 @@ const _i18n = {
     heartbeatIntervalHelp: "空闲超过此时间后发送「仍在运行」消息。0 表示关闭，最大 24。",
     checkUpdates: "自动检查更新",
     checkUpdatesHelp: "每 24 小时自动检查 GitHub 是否有新版本。",
+    messageTemplateSection: "消息模板",
+    messageTemplateHelp: "选择转发到控制群的单条消息版面样式。interval 模式（每次汇总后逐条转发）和 realtime 模式（即时推送）都生效。ID 显示、时间格式、语言设置会叠加在所选模板之上。",
+    template: "模板",
+    templateNormal: "标准",
+    templateMinimal: "极简",
+    templateNormalDesc: "发送者、时间、正文分行显示（默认）。",
+    templateMinimalDesc: "发送者与正文同行显示，时间置于第二行。",
+    templatePreview: "预览",
+    messageFieldsSection: "消息字段",
+    languageSection: "语言",
+    notificationsSection: "通知",
   }
 };
 
@@ -1121,6 +1144,32 @@ function buildTimeFormatDropdown(unitName, presets, currentValue, fieldId) {
     options.push('<option value="' + entry.value + '" ' + sel + '>' + tLabel(entry.label) + "</option>");
   });
   return '<select id="' + fieldId + '" data-tf-unit="' + unitName + '">' + options.join("") + "</select>";
+}
+
+function buildTemplatePreview(template, showIds) {
+  const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const sender = showIds ? "Alice (123456)" : "Alice";
+  const reply = showIds ? "Bob (789012)" : "Bob";
+  const time = "2026.01.24 15:30:45 (UTC+8)";
+  const msg = "MSG 999";
+  const body = "Hello world";
+  const replyText = "Are you coming tonight?";
+  const boxCSS = "font-family: var(--mono, ui-monospace, monospace); font-size: 13px; padding: 12px; border-radius: 6px; border: 1px solid var(--border, #ddd); background: var(--code-bg, #fafafa); line-height: 1.6; margin-top: 12px;";
+  const quoteCSS = "border-left: 3px solid var(--muted, #bbb); padding-left: 8px; margin: 4px 0; color: var(--muted, #666);";
+  let html;
+  if (template === "minimal") {
+    html = '<strong>' + esc(sender) + '</strong>: ' + esc(body)
+         + '<br>Time: ' + esc(time) + ' \u2014 ' + esc(msg)
+         + '<div style="' + quoteCSS + '">\u21a9 Reply to ' + esc(reply) + ' at ' + esc(time) + '</div>'
+         + '<div style="' + quoteCSS + '">' + esc(replyText) + '</div>';
+  } else {
+    html = '<strong>' + esc(sender) + '</strong>'
+         + '<br>Time: ' + esc(time) + ' \u2014 ' + esc(msg)
+         + '<br><strong>Content:</strong> ' + esc(body)
+         + '<div style="' + quoteCSS + '">\u21a9 Reply to ' + esc(reply) + ' at ' + esc(time) + '</div>'
+         + '<div style="' + quoteCSS + '">' + esc(replyText) + '</div>';
+  }
+  return '<div style="' + boxCSS + '">' + html + '</div>';
 }
 
 function timeFormatPreview(parts) {
@@ -1767,6 +1816,23 @@ function render() {
 
     <section class="section">
       <h2>${t("displayNotifications")}</h2>
+
+      <h3 style="margin-top:8px;margin-bottom:4px;font-size:15px;font-weight:600;">${t("messageTemplateSection")}</h3>
+      <p style="margin-top:0;margin-bottom:10px;font-size:13px;color:var(--muted,#666);">${t("messageTemplateHelp")}</p>
+      <div class="grid">
+        <div class="field">
+          <label>${t("template")}</label>
+          <select data-field="display.template">
+            <option value="normal" ${data.display.template !== "minimal" ? "selected" : ""}>${t("templateNormal")}</option>
+            <option value="minimal" ${data.display.template === "minimal" ? "selected" : ""}>${t("templateMinimal")}</option>
+          </select>
+          <small>${data.display.template === "minimal" ? t("templateMinimalDesc") : t("templateNormalDesc")}</small>
+        </div>
+      </div>
+      <label style="font-weight:600;margin-top:12px;display:block;">${t("templatePreview")}</label>
+      ${buildTemplatePreview(data.display.template, data.display.show_ids)}
+
+      <h3 style="margin-top:24px;margin-bottom:8px;font-size:15px;font-weight:600;">${t("messageFieldsSection")}</h3>
       <div class="grid">
         <div class="field">
           <label>${t("showIds")}</label>
@@ -1774,31 +1840,6 @@ function render() {
             <option value="true" ${data.display.show_ids ? "selected" : ""}>true</option>
             <option value="false" ${data.display.show_ids ? "" : "selected"}>false</option>
           </select>
-        </div>
-        <div class="field">
-          <label>${t("barkKey")}</label>
-          <input data-field="notifications.bark_key" value="${data.notifications.bark_key}" placeholder="${t("optional")}" />
-        </div>
-        <div class="field">
-          <label>${t("language")}</label>
-          <select data-field="display.language">
-            <option value="auto" ${data.display.language === "auto" ? "selected" : ""}>${t("languageAuto")}</option>
-            <option value="zh" ${data.display.language === "zh" ? "selected" : ""}>${t("languageZh")}</option>
-            <option value="en" ${data.display.language === "en" ? "selected" : ""}>${t("languageEn")}</option>
-          </select>
-        </div>
-        <div class="field">
-          <label>${t("heartbeatInterval")}</label>
-          <input type="number" data-field="notifications.heartbeat_interval_hours" value="${data.notifications.heartbeat_interval_hours}" placeholder="2" min="0" max="24" />
-          <small>${t("heartbeatIntervalHelp")}</small>
-        </div>
-        <div class="field">
-          <label>${t("checkUpdates")}</label>
-          <select data-field="notifications.check_updates">
-            <option value="true" ${data.notifications.check_updates ? "selected" : ""}>true</option>
-            <option value="false" ${data.notifications.check_updates ? "" : "selected"}>false</option>
-          </select>
-          <small>${t("checkUpdatesHelp")}</small>
         </div>
       </div>
       ${(() => {
@@ -1824,6 +1865,39 @@ function render() {
           + '<small><a href="#" data-action="tf-switch-custom">' + t("editRawStrftime") + '</a></small>'
           + '</div>';
       })()}
+
+      <h3 style="margin-top:24px;margin-bottom:8px;font-size:15px;font-weight:600;">${t("languageSection")}</h3>
+      <div class="grid">
+        <div class="field">
+          <label>${t("language")}</label>
+          <select data-field="display.language">
+            <option value="auto" ${data.display.language === "auto" ? "selected" : ""}>${t("languageAuto")}</option>
+            <option value="zh" ${data.display.language === "zh" ? "selected" : ""}>${t("languageZh")}</option>
+            <option value="en" ${data.display.language === "en" ? "selected" : ""}>${t("languageEn")}</option>
+          </select>
+        </div>
+      </div>
+
+      <h3 style="margin-top:24px;margin-bottom:8px;font-size:15px;font-weight:600;">${t("notificationsSection")}</h3>
+      <div class="grid">
+        <div class="field">
+          <label>${t("barkKey")}</label>
+          <input data-field="notifications.bark_key" value="${data.notifications.bark_key}" placeholder="${t("optional")}" />
+        </div>
+        <div class="field">
+          <label>${t("heartbeatInterval")}</label>
+          <input type="number" data-field="notifications.heartbeat_interval_hours" value="${data.notifications.heartbeat_interval_hours}" placeholder="2" min="0" max="24" />
+          <small>${t("heartbeatIntervalHelp")}</small>
+        </div>
+        <div class="field">
+          <label>${t("checkUpdates")}</label>
+          <select data-field="notifications.check_updates">
+            <option value="true" ${data.notifications.check_updates ? "selected" : ""}>true</option>
+            <option value="false" ${data.notifications.check_updates ? "" : "selected"}>false</option>
+          </select>
+          <small>${t("checkUpdatesHelp")}</small>
+        </div>
+      </div>
     </section>
 
     <section class="section">
@@ -1994,6 +2068,8 @@ function bindEvents() {
     const field = target.dataset.field;
     if (
       field === "sender.enabled" ||
+      field === "display.template" ||
+      field === "display.show_ids" ||
       field.startsWith("targets.") ||
       field.endsWith(".key") ||
       field.endsWith(".topic_routing_enabled") ||
@@ -2881,6 +2957,7 @@ def _normalize_config(raw: dict[str, Any]) -> dict[str, Any]:
             "show_ids": display.get("show_ids", True),
             "time_format": display.get("time_format", "%Y.%m.%d %H:%M:%S (%Z)"),
             "language": display.get("language", "auto"),
+            "template": display.get("template", "normal"),
         },
         "display_time_format_units": _TIME_FORMAT_UNITS,
         "notifications": {
@@ -3280,6 +3357,9 @@ def _validate_payload(payload: dict[str, Any], raw_existing: dict[str, Any]) -> 
             "language": str(display.get("language", "auto")).strip().lower()
             if str(display.get("language", "auto")).strip().lower() in ("auto", "zh", "en")
             else "auto",
+            "template": str(display.get("template", "normal")).strip().lower()
+            if str(display.get("template", "normal")).strip().lower() in VALID_DISPLAY_TEMPLATES
+            else "normal",
         },
         "notifications": {
             "bark_key": str(notifications.get("bark_key", "")).strip(),
@@ -3449,6 +3529,7 @@ def _render_toml(config: dict[str, Any], raw_existing: dict[str, Any]) -> str:
             f"retention_days = {reporting['retention_days']}",
             "",
             "[display]",
+            f"template = {toml_string(display.get('template', 'normal'))}",
             f"show_ids = {toml_bool(display['show_ids'])}",
             f"time_format = {toml_string(display['time_format'])}",
             f"language = {toml_string(display.get('language', 'auto'))}",
