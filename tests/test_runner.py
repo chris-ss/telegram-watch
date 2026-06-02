@@ -2,19 +2,23 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import logging
+import shutil
 import sqlite3
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 
 import pytest
+from telethon import errors
 
 from telegram_watch import runner
 from telegram_watch.config import (
     Config,
     ControlGroupConfig,
     DisplayConfig,
+    FullArchiveConfig,
     NotificationConfig,
     RealtimeConfig,
     ReportingConfig,
@@ -22,6 +26,7 @@ from telegram_watch.config import (
     TargetGroupConfig,
     TelegramConfig,
 )
+from telegram_watch import storage
 from telegram_watch.storage import DbMedia, DbMessage
 from telegram_watch.timeutils import utc_now
 
@@ -76,6 +81,30 @@ def build_config(tmp_path: Path) -> Config:
             media_extra_delay_sec=2.0,
             warmup_minutes=5.0,
             warmup_rate=5,
+        ),
+    )
+
+
+def enable_full_archive(
+    config: Config,
+    tmp_path: Path,
+    *,
+    capture_scope: str = "whole_group",
+    topic_ids: tuple[int, ...] = (),
+    backfill_limit_messages: int = 10_000,
+) -> Config:
+    return replace(
+        config,
+        full_archive=FullArchiveConfig(
+            enabled=True,
+            root_dir=tmp_path / "full_archive",
+            source_chat_id=config.targets[0].target_chat_id,
+            capture_scope=capture_scope,
+            topic_ids=topic_ids,
+            shard_policy="monthly",
+            max_messages_per_shard=500_000,
+            max_shard_size_mb=1024,
+            backfill_limit_messages=backfill_limit_messages,
         ),
     )
 
@@ -408,6 +437,2544 @@ def test_resolve_once_targets_invalid(tmp_path: Path):
     config = build_config(tmp_path)
     with pytest.raises(ValueError):
         runner._resolve_once_targets(config, "missing")
+
+
+def make_archive_event_message(
+    *,
+    message_id: int = 1,
+    chat_id: int = -123,
+    sender_id: int | None = 999,
+    topic_id: int | None = None,
+    text: str = "context",
+    media: object | None = None,
+    file: object | None = None,
+    action: object | None = None,
+) -> SimpleNamespace:
+    reply_to = None
+    reply_to_msg_id = None
+    if topic_id is not None:
+        reply_to = SimpleNamespace(
+            forum_topic=True,
+            reply_to_top_id=topic_id,
+            reply_to_msg_id=topic_id,
+        )
+        reply_to_msg_id = topic_id
+    return SimpleNamespace(
+        id=message_id,
+        chat_id=chat_id,
+        sender_id=sender_id,
+        date=datetime(2026, 5, 1, 12, message_id, tzinfo=timezone.utc),
+        message=text,
+        raw_text=text,
+        media=media,
+        file=file,
+        action=action,
+        reply_to=reply_to,
+        reply_to_msg_id=reply_to_msg_id,
+    )
+
+
+def test_archive_topic_id_prefers_reply_to_top_id() -> None:
+    message = SimpleNamespace(
+        reply_to_msg_id=367090,
+        reply_to=SimpleNamespace(
+            forum_topic=True,
+            reply_to_top_id=161204,
+            reply_to_msg_id=367090,
+        ),
+    )
+
+    assert runner._archive_topic_id_for_message(message) == 161204
+
+
+def test_archive_topic_id_treats_general_topic_as_unclassified() -> None:
+    message = SimpleNamespace(
+        reply_to_msg_id=1,
+        reply_to=SimpleNamespace(
+            forum_topic=True,
+            reply_to_top_id=1,
+            reply_to_msg_id=1,
+        ),
+    )
+
+    assert runner._archive_topic_id_for_message(message) is None
+
+
+def test_archive_topic_id_uses_forum_linkage_reply_as_best_effort_root() -> None:
+    message = SimpleNamespace(
+        reply_to_msg_id=161204,
+        reply_to=SimpleNamespace(
+            forum_topic=True,
+            reply_to_top_id=None,
+            reply_to_msg_id=161204,
+        ),
+    )
+
+    assert runner._archive_topic_id_for_message(message) == 161204
+
+
+def test_archive_topic_id_ignores_general_linkage_reply_root() -> None:
+    message = SimpleNamespace(
+        reply_to_msg_id=1,
+        reply_to=SimpleNamespace(
+            forum_topic=True,
+            reply_to_top_id=None,
+            reply_to_msg_id=1,
+        ),
+    )
+
+    assert runner._archive_topic_id_for_message(message) is None
+
+
+def test_archive_topic_id_keeps_non_forum_reply_unclassified() -> None:
+    message = SimpleNamespace(
+        reply_to_msg_id=42,
+        reply_to=SimpleNamespace(
+            forum_topic=False,
+            reply_to_top_id=None,
+            reply_to_msg_id=42,
+        ),
+    )
+
+    assert runner._archive_topic_id_for_message(message) is None
+
+
+def test_archive_message_from_telegram_uses_default_chat_and_tolerates_bad_optional_fields() -> None:
+    message = SimpleNamespace(
+        id="42",
+        chat_id=None,
+        sender_id="unknown",
+        date=datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc),
+        message="context",
+        raw_text="context",
+        media=SimpleNamespace(document=SimpleNamespace(mime_type="image/jpeg")),
+        file=SimpleNamespace(mime_type="image/jpeg", size="unknown", name="chart.jpg"),
+        action=None,
+        reply_to=SimpleNamespace(
+            forum_topic=True,
+            reply_to_top_id="77",
+            reply_to_msg_id="bad",
+        ),
+        reply_to_msg_id="bad",
+    )
+
+    archive_message = runner._archive_message_from_telegram(
+        message,
+        chat_id_default=-1001,
+    )
+
+    assert archive_message is not None
+    assert archive_message.chat_id == -1001
+    assert archive_message.message_id == 42
+    assert archive_message.sender_id is None
+    assert archive_message.topic_id == 77
+    assert archive_message.reply_to_msg_id is None
+    assert archive_message.reply_to_top_id == 77
+    assert archive_message.media[0].file_size is None
+
+
+def test_archive_message_from_telegram_skips_messages_without_stable_identity() -> None:
+    missing_chat = SimpleNamespace(
+        id=1,
+        chat_id=None,
+        date=datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc),
+    )
+    bad_message_id = SimpleNamespace(
+        id="not-a-message-id",
+        chat_id=-1001,
+        date=datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc),
+    )
+    missing_date = SimpleNamespace(id=1, chat_id=-1001, date=None)
+    bad_date = SimpleNamespace(id=1, chat_id=-1001, date="not-a-datetime")
+
+    assert runner._archive_message_from_telegram(missing_chat) is None
+    assert runner._archive_message_from_telegram(bad_message_id) is None
+    assert runner._archive_message_from_telegram(missing_date) is None
+    assert runner._archive_message_from_telegram(bad_date) is None
+
+
+def test_archive_message_from_telegram_keeps_service_messages_without_text() -> None:
+    message = make_archive_event_message(
+        message_id=9,
+        text="",
+        action=SimpleNamespace(kind="MessageActionPinMessage"),
+    )
+    message.raw_text = ""
+
+    archive_message = runner._archive_message_from_telegram(message)
+
+    assert archive_message is not None
+    assert archive_message.message_kind == "service"
+    assert archive_message.text == ""
+    assert archive_message.raw_text == ""
+
+
+@pytest.mark.asyncio
+async def test_full_archive_handler_captures_non_tracked_message(tmp_path: Path):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    handler = runner._FullArchiveHandler(config)
+    msg = make_archive_event_message(sender_id=999, text="non tracked context")
+
+    await handler.handle(SimpleNamespace(message=msg))
+
+    shard_path = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-05.sqlite3"
+    )
+    conn = sqlite3.connect(shard_path)
+    try:
+        row = conn.execute(
+            "SELECT sender_id, text, payload_mode FROM archive_messages"
+        ).fetchone()
+    finally:
+        conn.close()
+    manifest = sqlite3.connect(config.full_archive.root_dir / "manifest.sqlite3")
+    try:
+        tracked_db_link_count = manifest.execute(
+            "SELECT COUNT(*) FROM tracked_db_links WHERE status = 'active'"
+        ).fetchone()[0]
+    finally:
+        manifest.close()
+
+    assert row == (999, "non tracked context", "archive")
+    assert tracked_db_link_count == 1
+
+
+@pytest.mark.asyncio
+async def test_full_archive_handler_stores_media_metadata_without_download(
+    monkeypatch,
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    handler = runner._FullArchiveHandler(config)
+
+    def fail_download(*_args, **_kwargs):
+        raise AssertionError("full archive must not download media")
+
+    monkeypatch.setattr(runner, "_download_media", fail_download)
+    msg = make_archive_event_message(
+        message_id=2,
+        media=SimpleNamespace(document=SimpleNamespace(mime_type="image/png", size=456)),
+        file=SimpleNamespace(mime_type="image/png", size=456, name="chart.png"),
+    )
+
+    await handler.handle(SimpleNamespace(message=msg))
+
+    shard_path = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-05.sqlite3"
+    )
+    conn = sqlite3.connect(shard_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT media_index, media_kind, mime_type, file_size, file_name
+            FROM archive_media
+            WHERE chat_id = ? AND message_id = ?
+            """,
+            (msg.chat_id, msg.id),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert tuple(row) == (0, "SimpleNamespace", "image/png", 456, "chart.png")
+
+
+@pytest.mark.asyncio
+async def test_full_archive_handler_persists_in_thread(monkeypatch, tmp_path: Path):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    handler = runner._FullArchiveHandler(config)
+    calls: list[object] = []
+
+    async def fake_to_thread(func, /, *args, **kwargs):
+        calls.append(func)
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(runner.asyncio, "to_thread", fake_to_thread)
+
+    await handler.handle(SimpleNamespace(message=make_archive_event_message()))
+
+    assert calls == [runner._persist_archive_message_to_storage]
+
+
+@pytest.mark.asyncio
+async def test_full_archive_handler_filters_unconfigured_topics(tmp_path: Path):
+    config = enable_full_archive(
+        build_config(tmp_path),
+        tmp_path,
+        capture_scope="topics",
+        topic_ids=(10,),
+    )
+    handler = runner._FullArchiveHandler(config)
+
+    await handler.handle(
+        SimpleNamespace(message=make_archive_event_message(topic_id=20))
+    )
+
+    assert not config.full_archive.root_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_full_archive_handler_topic_scope_excludes_other_topics_and_general(
+    tmp_path: Path,
+):
+    config = enable_full_archive(
+        build_config(tmp_path),
+        tmp_path,
+        capture_scope="topics",
+        topic_ids=(10,),
+    )
+    handler = runner._FullArchiveHandler(config)
+
+    await handler.handle(
+        SimpleNamespace(
+            message=make_archive_event_message(
+                message_id=1,
+                topic_id=10,
+                text="configured topic",
+            )
+        )
+    )
+    await handler.handle(
+        SimpleNamespace(
+            message=make_archive_event_message(
+                message_id=2,
+                topic_id=20,
+                text="other topic",
+            )
+        )
+    )
+    await handler.handle(
+        SimpleNamespace(
+            message=make_archive_event_message(
+                message_id=3,
+                text="general or unknown topic",
+            )
+        )
+    )
+
+    shard_path = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-05.sqlite3"
+    )
+    conn = sqlite3.connect(shard_path)
+    try:
+        rows = conn.execute(
+            "SELECT message_id, topic_id, text FROM archive_messages"
+        ).fetchall()
+    finally:
+        conn.close()
+    manifest = sqlite3.connect(config.full_archive.root_dir / "manifest.sqlite3")
+    try:
+        manifest_count = manifest.execute(
+            "SELECT SUM(message_count) FROM archive_shards"
+        ).fetchone()[0]
+    finally:
+        manifest.close()
+
+    assert [tuple(row) for row in rows] == [(1, 10, "configured topic")]
+    assert manifest_count == 1
+
+
+@pytest.mark.asyncio
+async def test_full_archive_handler_after_root_deletion_keeps_tracked_ref_dedup(
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    handler = runner._FullArchiveHandler(config)
+    tracked_message = make_archive_event_message(
+        message_id=2,
+        sender_id=config.targets[0].tracked_user_ids[0],
+        text="archive duplicate candidate",
+        media=SimpleNamespace(document=SimpleNamespace(mime_type="image/png", size=123)),
+        file=SimpleNamespace(mime_type="image/png", size=123, name="chart.png"),
+    )
+    tracked = storage.connect(config.storage.db_path)
+    storage.ensure_schema(tracked)
+    try:
+        storage.persist_message(
+            tracked,
+            storage.StoredMessage(
+                chat_id=tracked_message.chat_id,
+                message_id=tracked_message.id,
+                sender_id=tracked_message.sender_id,
+                date=tracked_message.date,
+                text="tracked payload survives live archive reset",
+                reply_to_msg_id=None,
+                replied_sender_id=None,
+                replied_date=None,
+                replied_text=None,
+            ),
+            [],
+        )
+    finally:
+        tracked.close()
+
+    await handler.handle(
+        SimpleNamespace(
+            message=make_archive_event_message(message_id=1, text="before deletion")
+        )
+    )
+    assert (config.full_archive.root_dir / "manifest.sqlite3").exists()
+
+    shutil.rmtree(config.full_archive.root_dir)
+
+    await handler.handle(SimpleNamespace(message=tracked_message))
+
+    manifest = sqlite3.connect(config.full_archive.root_dir / "manifest.sqlite3")
+    try:
+        manifest_count = manifest.execute(
+            "SELECT SUM(message_count) FROM archive_shards"
+        ).fetchone()[0]
+        shard_path = manifest.execute("SELECT path FROM archive_shards").fetchone()[0]
+    finally:
+        manifest.close()
+    shard = sqlite3.connect(config.full_archive.root_dir / shard_path)
+    try:
+        row = shard.execute(
+            """
+            SELECT message_id, payload_mode, text, raw_text,
+                   tracked_message_chat_id, tracked_message_id
+            FROM archive_messages
+            """
+        ).fetchone()
+        archive_media_count = shard.execute(
+            "SELECT COUNT(*) FROM archive_media"
+        ).fetchone()[0]
+        link_count = shard.execute(
+            "SELECT COUNT(*) FROM archive_tracked_links"
+        ).fetchone()[0]
+    finally:
+        shard.close()
+
+    assert manifest_count == 1
+    assert tuple(row) == (
+        2,
+        "tracked_ref",
+        None,
+        None,
+        tracked_message.chat_id,
+        tracked_message.id,
+    )
+    assert archive_media_count == 0
+    assert link_count == 1
+
+
+@pytest.mark.asyncio
+async def test_full_archive_handler_swallows_storage_errors(
+    monkeypatch, tmp_path: Path, caplog
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    handler = runner._FullArchiveHandler(config)
+
+    def fail_persist(*_args, **_kwargs):
+        raise OSError("archive unavailable")
+
+    monkeypatch.setattr(runner, "_persist_archive_message_to_storage", fail_persist)
+
+    with caplog.at_level(logging.WARNING):
+        await handler.handle(SimpleNamespace(message=make_archive_event_message()))
+
+    assert "Full archive capture failed without stopping watcher" in caplog.text
+
+
+def test_archive_persist_does_not_record_tracked_db_link_when_shard_write_fails(
+    monkeypatch,
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    message = runner._archive_message_from_telegram(make_archive_event_message())
+    assert message is not None
+
+    def fail_persist(*_args, **_kwargs):
+        raise sqlite3.OperationalError("disk full")
+
+    monkeypatch.setattr(runner, "persist_archive_message", fail_persist)
+
+    with pytest.raises(sqlite3.OperationalError, match="disk full"):
+        runner._persist_archive_message_to_storage(
+            config,
+            message,
+            tracked_db_path=config.storage.db_path,
+        )
+
+    manifest = sqlite3.connect(config.full_archive.root_dir / "manifest.sqlite3")
+    try:
+        count = manifest.execute(
+            "SELECT COUNT(*) FROM tracked_db_links WHERE status = 'active'"
+        ).fetchone()[0]
+    finally:
+        manifest.close()
+
+    assert count == 0
+
+
+def test_archive_persist_does_not_record_tracked_db_link_when_manifest_count_fails(
+    monkeypatch,
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    message = runner._archive_message_from_telegram(make_archive_event_message())
+    assert message is not None
+
+    def fail_record_shard_write(*_args, **_kwargs):
+        raise sqlite3.OperationalError("manifest write failed")
+
+    monkeypatch.setattr(runner, "record_shard_write", fail_record_shard_write)
+
+    with pytest.raises(sqlite3.OperationalError, match="manifest write failed"):
+        runner._persist_archive_message_to_storage(
+            config,
+            message,
+            tracked_db_path=config.storage.db_path,
+        )
+
+    manifest = sqlite3.connect(config.full_archive.root_dir / "manifest.sqlite3")
+    try:
+        link_count = manifest.execute(
+            "SELECT COUNT(*) FROM tracked_db_links WHERE status = 'active'"
+        ).fetchone()[0]
+    finally:
+        manifest.close()
+
+    assert link_count == 0
+
+
+@pytest.mark.asyncio
+async def test_tracked_persist_relinks_existing_archive_row(monkeypatch, tmp_path: Path):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    msg = make_archive_event_message(
+        sender_id=config.targets[0].tracked_user_ids[0],
+        text="archive copy",
+    )
+    archive_msg = runner._archive_message_from_telegram(msg)
+    assert archive_msg is not None
+    runner._persist_archive_message_to_storage(
+        config,
+        archive_msg,
+        tracked_db_path=config.storage.db_path,
+    )
+
+    tracked = storage.connect(config.storage.db_path)
+    storage.ensure_schema(tracked)
+    storage.persist_message(
+        tracked,
+        storage.StoredMessage(
+            chat_id=msg.chat_id,
+            message_id=msg.id,
+            sender_id=msg.sender_id,
+            date=msg.date,
+            text="tracked payload",
+            reply_to_msg_id=None,
+            replied_sender_id=None,
+            replied_date=None,
+            replied_text=None,
+        ),
+        [],
+    )
+    tracked.close()
+
+    calls: list[object] = []
+
+    async def fake_to_thread(func, /, *args, **kwargs):
+        calls.append(func)
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(runner.asyncio, "to_thread", fake_to_thread)
+
+    await runner._relink_archive_message_after_tracked_persist(
+        config,
+        msg,
+        storage.StoredMessage(
+            chat_id=msg.chat_id,
+            message_id=msg.id,
+            sender_id=msg.sender_id,
+            date=msg.date,
+            text="tracked payload",
+            reply_to_msg_id=None,
+            replied_sender_id=None,
+            replied_date=None,
+            replied_text=None,
+        ),
+    )
+
+    shard_path = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-05.sqlite3"
+    )
+    conn = sqlite3.connect(shard_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT text, raw_text, payload_mode, tracked_message_chat_id,
+                   tracked_message_id
+            FROM archive_messages
+            WHERE chat_id = ? AND message_id = ?
+            """,
+            (msg.chat_id, msg.id),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert row == (None, None, "tracked_ref", msg.chat_id, msg.id)
+    assert calls == [runner._persist_archive_message_to_storage]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("topic_id", [20, None])
+async def test_tracked_persist_relink_respects_topic_scope(
+    monkeypatch,
+    tmp_path: Path,
+    topic_id: int | None,
+):
+    config = enable_full_archive(
+        build_config(tmp_path),
+        tmp_path,
+        capture_scope="topics",
+        topic_ids=(10,),
+    )
+    msg = make_archive_event_message(
+        message_id=9,
+        topic_id=topic_id,
+        sender_id=config.targets[0].tracked_user_ids[0],
+        text="tracked message outside archive topic",
+    )
+    tracked_message = storage.StoredMessage(
+        chat_id=msg.chat_id,
+        message_id=msg.id,
+        sender_id=msg.sender_id,
+        date=msg.date,
+        text="tracked payload outside topic",
+        reply_to_msg_id=None,
+        replied_sender_id=None,
+        replied_date=None,
+        replied_text=None,
+    )
+    tracked = storage.connect(config.storage.db_path)
+    storage.ensure_schema(tracked)
+    try:
+        storage.persist_message(tracked, tracked_message, [])
+    finally:
+        tracked.close()
+
+    calls: list[object] = []
+
+    async def fake_to_thread(func, /, *args, **kwargs):
+        calls.append(func)
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(runner.asyncio, "to_thread", fake_to_thread)
+
+    await runner._relink_archive_message_after_tracked_persist(
+        config,
+        msg,
+        tracked_message,
+    )
+
+    assert calls == []
+    assert not config.full_archive.root_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_archive_relink_scheduler_tracks_task_until_done(monkeypatch, tmp_path: Path):
+    disabled_config = build_config(tmp_path)
+    config = enable_full_archive(disabled_config, tmp_path)
+    msg = make_archive_event_message(
+        sender_id=config.targets[0].tracked_user_ids[0],
+        text="tracked payload",
+    )
+    stored = storage.StoredMessage(
+        chat_id=msg.chat_id,
+        message_id=msg.id,
+        sender_id=msg.sender_id,
+        date=msg.date,
+        text="tracked payload",
+        reply_to_msg_id=None,
+        replied_sender_id=None,
+        replied_date=None,
+        replied_text=None,
+    )
+    disabled_tasks: set[asyncio.Task[None]] = set()
+
+    assert (
+        runner._schedule_archive_relink_after_tracked_persist(
+            disabled_config,
+            msg,
+            stored,
+            task_set=disabled_tasks,
+        )
+        is None
+    )
+    assert disabled_tasks == set()
+
+    relink_started = asyncio.Event()
+    release_relink = asyncio.Event()
+
+    async def fake_relink(*_args, **_kwargs):
+        relink_started.set()
+        await release_relink.wait()
+
+    monkeypatch.setattr(
+        runner,
+        "_relink_archive_message_after_tracked_persist",
+        fake_relink,
+    )
+
+    pending_tasks: set[asyncio.Task[None]] = set()
+    task = runner._schedule_archive_relink_after_tracked_persist(
+        config,
+        msg,
+        stored,
+        task_set=pending_tasks,
+    )
+
+    assert task is not None
+    assert task in pending_tasks
+    await asyncio.wait_for(relink_started.wait(), timeout=0.2)
+    assert task in pending_tasks
+
+    release_relink.set()
+    await asyncio.wait_for(task, timeout=0.2)
+    await asyncio.sleep(0)
+    assert task not in pending_tasks
+
+
+@pytest.mark.asyncio
+async def test_tracked_handler_drain_archive_relinks_waits_for_pending_task(
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    handler = runner._TargetHandler(config, SimpleNamespace(), config.targets[0])
+    release_relink = asyncio.Event()
+
+    async def pending_relink() -> None:
+        await release_relink.wait()
+
+    task = asyncio.create_task(pending_relink())
+    handler._archive_relink_tasks.add(task)
+    task.add_done_callback(handler._archive_relink_tasks.discard)
+
+    release_relink.set()
+    pending_count = await handler.drain_archive_relinks(timeout=0.2)
+
+    assert pending_count == 0
+    assert task.done()
+    assert task not in handler._archive_relink_tasks
+
+
+@pytest.mark.asyncio
+async def test_tracked_handler_drain_archive_relinks_warns_on_timeout(
+    tmp_path: Path,
+    caplog,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    handler = runner._TargetHandler(config, SimpleNamespace(), config.targets[0])
+    release_relink = asyncio.Event()
+
+    async def pending_relink() -> None:
+        await release_relink.wait()
+
+    task = asyncio.create_task(pending_relink())
+    handler._archive_relink_tasks.add(task)
+    task.add_done_callback(handler._archive_relink_tasks.discard)
+
+    with caplog.at_level(logging.WARNING):
+        pending_count = await handler.drain_archive_relinks(timeout=0.01)
+
+    assert pending_count == 1
+    assert task in handler._archive_relink_tasks
+    assert "Full archive relink still pending at shutdown" in caplog.text
+
+    release_relink.set()
+    await asyncio.wait_for(task, timeout=0.2)
+    await asyncio.sleep(0)
+    assert task not in handler._archive_relink_tasks
+
+
+@pytest.mark.asyncio
+async def test_tracked_handler_drain_archive_relinks_handles_cancelled_task(
+    tmp_path: Path,
+    caplog,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    handler = runner._TargetHandler(config, SimpleNamespace(), config.targets[0])
+
+    async def pending_relink() -> None:
+        await asyncio.sleep(10)
+
+    task = asyncio.create_task(pending_relink())
+    handler._archive_relink_tasks.add(task)
+    task.add_done_callback(handler._archive_relink_tasks.discard)
+    task.cancel()
+
+    with caplog.at_level(logging.WARNING):
+        pending_count = await handler.drain_archive_relinks(timeout=0.2)
+
+    assert pending_count == 0
+    assert task.cancelled()
+    assert task not in handler._archive_relink_tasks
+    assert "Full archive relink task was cancelled during shutdown" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_tracked_handler_continues_realtime_after_archive_relink_error(
+    monkeypatch,
+    tmp_path: Path,
+    caplog,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    queue: asyncio.Queue[tuple[DbMessage, TargetGroupConfig]] = asyncio.Queue()
+    handler = runner._TargetHandler(
+        config,
+        SimpleNamespace(),
+        config.targets[0],
+        realtime_queue=queue,
+    )
+    msg = make_archive_event_message(
+        sender_id=config.targets[0].tracked_user_ids[0],
+        text="tracked payload",
+    )
+
+    async def fake_capture_message(_client, _config, message, *, chat_id_default=None):
+        return (
+            storage.StoredMessage(
+                chat_id=int(getattr(message, "chat_id", chat_id_default or 0)),
+                message_id=int(message.id),
+                sender_id=int(message.sender_id),
+                date=message.date,
+                text="tracked payload",
+                reply_to_msg_id=None,
+                replied_sender_id=None,
+                replied_date=None,
+                replied_text=None,
+            ),
+            [],
+        )
+
+    def fail_archive_persist(*_args, **_kwargs):
+        raise OSError("archive unavailable")
+
+    created_tasks: list[asyncio.Task] = []
+    real_create_task = asyncio.create_task
+
+    def record_create_task(coro):
+        task = real_create_task(coro)
+        created_tasks.append(task)
+        return task
+
+    monkeypatch.setattr(runner, "_capture_message", fake_capture_message)
+    monkeypatch.setattr(
+        runner,
+        "_persist_archive_message_to_storage",
+        fail_archive_persist,
+    )
+    monkeypatch.setattr(runner.asyncio, "create_task", record_create_task)
+
+    with caplog.at_level(logging.WARNING):
+        await handler.handle(SimpleNamespace(message=msg))
+        await asyncio.gather(*created_tasks)
+
+    with storage.db_session(config.storage.db_path) as conn:
+        db_row = conn.execute(
+            """
+            SELECT text
+            FROM messages
+            WHERE chat_id = ? AND message_id = ?
+            """,
+            (msg.chat_id, msg.id),
+        ).fetchone()
+
+    queued_message, queued_target = queue.get_nowait()
+    assert db_row is not None
+    assert db_row["text"] == "tracked payload"
+    assert queued_message.message_id == msg.id
+    assert queued_message.text == "tracked payload"
+    assert queued_target == config.targets[0]
+    assert "Full archive relink failed after tracked persist" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_tracked_handler_does_not_wait_for_archive_relink_before_realtime(
+    monkeypatch,
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    queue: asyncio.Queue[tuple[DbMessage, TargetGroupConfig]] = asyncio.Queue()
+    handler = runner._TargetHandler(
+        config,
+        SimpleNamespace(),
+        config.targets[0],
+        realtime_queue=queue,
+    )
+    msg = make_archive_event_message(
+        sender_id=config.targets[0].tracked_user_ids[0],
+        text="tracked payload",
+    )
+    relink_started = asyncio.Event()
+    release_relink = asyncio.Event()
+    created_tasks: list[asyncio.Task] = []
+    real_create_task = asyncio.create_task
+
+    async def fake_capture_message(_client, _config, message, *, chat_id_default=None):
+        return (
+            storage.StoredMessage(
+                chat_id=int(getattr(message, "chat_id", chat_id_default or 0)),
+                message_id=int(message.id),
+                sender_id=int(message.sender_id),
+                date=message.date,
+                text="tracked payload",
+                reply_to_msg_id=None,
+                replied_sender_id=None,
+                replied_date=None,
+                replied_text=None,
+            ),
+            [],
+        )
+
+    async def hanging_relink(*_args, **_kwargs):
+        relink_started.set()
+        await release_relink.wait()
+
+    def record_create_task(coro):
+        task = real_create_task(coro)
+        created_tasks.append(task)
+        return task
+
+    monkeypatch.setattr(runner, "_capture_message", fake_capture_message)
+    monkeypatch.setattr(
+        runner,
+        "_relink_archive_message_after_tracked_persist",
+        hanging_relink,
+    )
+    monkeypatch.setattr(runner.asyncio, "create_task", record_create_task)
+
+    await asyncio.wait_for(handler.handle(SimpleNamespace(message=msg)), timeout=0.2)
+
+    queued_message, queued_target = queue.get_nowait()
+    assert queued_message.message_id == msg.id
+    assert queued_target == config.targets[0]
+    assert relink_started.is_set() or created_tasks
+
+    release_relink.set()
+    await asyncio.gather(*created_tasks)
+
+
+@pytest.mark.asyncio
+async def test_full_archive_then_tracked_handler_relinks_without_duplicate_payload(
+    monkeypatch,
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    msg = make_archive_event_message(
+        sender_id=config.targets[0].tracked_user_ids[0],
+        text="archive duplicate",
+        media=SimpleNamespace(document=SimpleNamespace(mime_type="image/png", size=456)),
+        file=SimpleNamespace(mime_type="image/png", size=456, name="chart.png"),
+    )
+    full_archive_handler = runner._FullArchiveHandler(config)
+    target_handler = runner._TargetHandler(
+        config,
+        SimpleNamespace(),
+        config.targets[0],
+    )
+
+    async def immediate_to_thread(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    async def fake_capture_message(_client, _config, message, *, chat_id_default=None):
+        return (
+            storage.StoredMessage(
+                chat_id=int(getattr(message, "chat_id", chat_id_default or 0)),
+                message_id=int(message.id),
+                sender_id=int(message.sender_id),
+                date=message.date,
+                text="tracked payload",
+                reply_to_msg_id=None,
+                replied_sender_id=None,
+                replied_date=None,
+                replied_text=None,
+            ),
+            [],
+        )
+
+    created_tasks: list[asyncio.Task] = []
+    real_create_task = asyncio.create_task
+
+    def record_create_task(coro):
+        task = real_create_task(coro)
+        created_tasks.append(task)
+        return task
+
+    monkeypatch.setattr(runner.asyncio, "to_thread", immediate_to_thread)
+    monkeypatch.setattr(runner, "_capture_message", fake_capture_message)
+    monkeypatch.setattr(runner.asyncio, "create_task", record_create_task)
+
+    await full_archive_handler.handle(SimpleNamespace(message=msg))
+    await target_handler.handle(SimpleNamespace(message=msg))
+    await asyncio.gather(*created_tasks)
+
+    shard_path = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-05.sqlite3"
+    )
+    conn = sqlite3.connect(shard_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT text, raw_text, payload_mode, tracked_message_chat_id,
+                   tracked_message_id
+            FROM archive_messages
+            WHERE chat_id = ? AND message_id = ?
+            """,
+            (msg.chat_id, msg.id),
+        ).fetchone()
+        media_count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM archive_media
+            WHERE chat_id = ? AND message_id = ?
+            """,
+            (msg.chat_id, msg.id),
+        ).fetchone()[0]
+        link_count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM archive_tracked_links
+            WHERE chat_id = ? AND message_id = ?
+            """,
+            (msg.chat_id, msg.id),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    assert tuple(row) == (None, None, "tracked_ref", msg.chat_id, msg.id)
+    assert media_count == 0
+    assert link_count == 1
+
+
+@pytest.mark.asyncio
+async def test_tracked_then_full_archive_handler_keeps_tracked_ref_idempotent(
+    monkeypatch,
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    msg = make_archive_event_message(
+        sender_id=config.targets[0].tracked_user_ids[0],
+        text="archive duplicate",
+        media=SimpleNamespace(document=SimpleNamespace(mime_type="image/png", size=456)),
+        file=SimpleNamespace(mime_type="image/png", size=456, name="chart.png"),
+    )
+    full_archive_handler = runner._FullArchiveHandler(config)
+    target_handler = runner._TargetHandler(
+        config,
+        SimpleNamespace(),
+        config.targets[0],
+    )
+
+    async def immediate_to_thread(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    async def fake_capture_message(_client, _config, message, *, chat_id_default=None):
+        return (
+            storage.StoredMessage(
+                chat_id=int(getattr(message, "chat_id", chat_id_default or 0)),
+                message_id=int(message.id),
+                sender_id=int(message.sender_id),
+                date=message.date,
+                text="tracked payload",
+                reply_to_msg_id=None,
+                replied_sender_id=None,
+                replied_date=None,
+                replied_text=None,
+            ),
+            [],
+        )
+
+    created_tasks: list[asyncio.Task] = []
+    real_create_task = asyncio.create_task
+
+    def record_create_task(coro):
+        task = real_create_task(coro)
+        created_tasks.append(task)
+        return task
+
+    monkeypatch.setattr(runner.asyncio, "to_thread", immediate_to_thread)
+    monkeypatch.setattr(runner, "_capture_message", fake_capture_message)
+    monkeypatch.setattr(runner.asyncio, "create_task", record_create_task)
+
+    await target_handler.handle(SimpleNamespace(message=msg))
+    await asyncio.gather(*created_tasks)
+    await full_archive_handler.handle(SimpleNamespace(message=msg))
+
+    shard_path = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-05.sqlite3"
+    )
+    conn = sqlite3.connect(shard_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT text, raw_text, payload_mode, tracked_message_chat_id,
+                   tracked_message_id
+            FROM archive_messages
+            WHERE chat_id = ? AND message_id = ?
+            """,
+            (msg.chat_id, msg.id),
+        ).fetchone()
+        media_count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM archive_media
+            WHERE chat_id = ? AND message_id = ?
+            """,
+            (msg.chat_id, msg.id),
+        ).fetchone()[0]
+        link_count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM archive_tracked_links
+            WHERE chat_id = ? AND message_id = ?
+            """,
+            (msg.chat_id, msg.id),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    manifest = sqlite3.connect(config.full_archive.root_dir / "manifest.sqlite3")
+    try:
+        manifest_count = manifest.execute(
+            "SELECT message_count FROM archive_shards"
+        ).fetchone()[0]
+    finally:
+        manifest.close()
+
+    assert tuple(row) == (None, None, "tracked_ref", msg.chat_id, msg.id)
+    assert media_count == 0
+    assert link_count == 1
+    assert manifest_count == 1
+
+
+@pytest.mark.asyncio
+async def test_full_archive_handler_updates_archive_row_for_edited_message(
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    handler = runner._FullArchiveHandler(config)
+    original = make_archive_event_message(message_id=7, text="before edit")
+    edited = make_archive_event_message(message_id=7, text="after edit")
+
+    await handler.handle(SimpleNamespace(message=original))
+    await handler.handle(SimpleNamespace(message=edited))
+
+    shard_path = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-05.sqlite3"
+    )
+    conn = sqlite3.connect(shard_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT text, raw_text, payload_mode
+            FROM archive_messages
+            WHERE chat_id = ? AND message_id = ?
+            """,
+            (original.chat_id, original.id),
+        ).fetchone()
+    finally:
+        conn.close()
+    manifest = sqlite3.connect(config.full_archive.root_dir / "manifest.sqlite3")
+    try:
+        manifest_count = manifest.execute(
+            "SELECT message_count FROM archive_shards"
+        ).fetchone()[0]
+    finally:
+        manifest.close()
+
+    assert row == ("after edit", "after edit", "archive")
+    assert manifest_count == 1
+
+
+@pytest.mark.asyncio
+async def test_full_archive_edited_message_preserves_tracked_ref_without_duplicate_payload(
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    handler = runner._FullArchiveHandler(config)
+    tracked = storage.connect(config.storage.db_path)
+    storage.ensure_schema(tracked)
+    try:
+        storage.persist_message(
+            tracked,
+            storage.StoredMessage(
+                chat_id=config.full_archive.source_chat_id or config.targets[0].target_chat_id,
+                message_id=8,
+                sender_id=config.targets[0].tracked_user_ids[0],
+                date=datetime(2026, 5, 1, 12, 8, tzinfo=timezone.utc),
+                text="tracked payload",
+                reply_to_msg_id=None,
+                replied_sender_id=None,
+                replied_date=None,
+                replied_text=None,
+            ),
+            [],
+        )
+    finally:
+        tracked.close()
+
+    original = make_archive_event_message(
+        message_id=8,
+        sender_id=config.targets[0].tracked_user_ids[0],
+        text="archive duplicate before edit",
+        media=SimpleNamespace(document=SimpleNamespace(mime_type="image/png", size=456)),
+        file=SimpleNamespace(mime_type="image/png", size=456, name="before.png"),
+    )
+    edited = make_archive_event_message(
+        message_id=8,
+        sender_id=config.targets[0].tracked_user_ids[0],
+        text="archive duplicate after edit",
+        media=SimpleNamespace(document=SimpleNamespace(mime_type="image/png", size=789)),
+        file=SimpleNamespace(mime_type="image/png", size=789, name="after.png"),
+    )
+
+    await handler.handle(SimpleNamespace(message=original))
+    await handler.handle(SimpleNamespace(message=edited))
+
+    shard_path = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-05.sqlite3"
+    )
+    conn = sqlite3.connect(shard_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT text, raw_text, payload_mode, tracked_message_chat_id,
+                   tracked_message_id
+            FROM archive_messages
+            WHERE chat_id = ? AND message_id = ?
+            """,
+            (original.chat_id, original.id),
+        ).fetchone()
+        media_count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM archive_media
+            WHERE chat_id = ? AND message_id = ?
+            """,
+            (original.chat_id, original.id),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    manifest = sqlite3.connect(config.full_archive.root_dir / "manifest.sqlite3")
+    try:
+        manifest_count = manifest.execute(
+            "SELECT message_count FROM archive_shards"
+        ).fetchone()[0]
+    finally:
+        manifest.close()
+
+    assert tuple(row) == (None, None, "tracked_ref", original.chat_id, original.id)
+    assert media_count == 0
+    assert manifest_count == 1
+
+
+@pytest.mark.asyncio
+async def test_run_daemon_registers_full_archive_handler_when_enabled(
+    monkeypatch, tmp_path: Path
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    config = replace(
+        config,
+        notifications=NotificationConfig(
+            bark_key=None,
+            heartbeat_interval_hours=0,
+            check_updates=False,
+        ),
+    )
+    handlers = []
+
+    class DummyClient:
+        def add_event_handler(self, callback, event):
+            handlers.append((callback, event))
+
+        async def get_me(self):
+            return SimpleNamespace(id=42, username="me")
+
+        async def disconnect(self):
+            return None
+
+    async def fake_start_client(_client, _role):
+        return None
+
+    async def fake_run_with_reconnect(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(runner, "_build_client", lambda _config: DummyClient())
+    monkeypatch.setattr(runner, "_start_client", fake_start_client)
+    monkeypatch.setattr(runner, "_run_with_reconnect", fake_run_with_reconnect)
+
+    await runner.run_daemon(config)
+
+    archive_events = [
+        event
+        for callback, event in handlers
+        if isinstance(getattr(callback, "__self__", None), runner._FullArchiveHandler)
+    ]
+    assert len(archive_events) == 2
+    assert any(isinstance(event, runner.events.NewMessage) for event in archive_events)
+    assert any(
+        isinstance(event, runner.events.MessageEdited) for event in archive_events
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_daemon_skips_full_archive_handlers_when_archive_degraded(
+    monkeypatch,
+    tmp_path: Path,
+    caplog,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    config = replace(
+        config,
+        notifications=NotificationConfig(
+            bark_key=None,
+            heartbeat_interval_hours=0,
+            check_updates=False,
+        ),
+    )
+    handlers = []
+
+    class DummyClient:
+        def add_event_handler(self, callback, event):
+            handlers.append((callback, event))
+
+        async def get_me(self):
+            return SimpleNamespace(id=42, username="me")
+
+        async def disconnect(self):
+            return None
+
+    async def fake_start_client(_client, _role):
+        return None
+
+    async def fake_run_with_reconnect(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(runner, "_build_client", lambda _config: DummyClient())
+    monkeypatch.setattr(runner, "_start_client", fake_start_client)
+    monkeypatch.setattr(runner, "_run_with_reconnect", fake_run_with_reconnect)
+    monkeypatch.setattr(
+        runner,
+        "inspect_archive_status",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            degraded=True,
+            errors=("hidden shard data",),
+        ),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        await runner.run_daemon(config)
+
+    target_handlers = [
+        getattr(callback, "__self__", None)
+        for callback, _event in handlers
+        if isinstance(getattr(callback, "__self__", None), runner._TargetHandler)
+    ]
+    assert len(target_handlers) == 1
+    assert target_handlers[0]._archive_relink_enabled is False
+    assert not any(
+        isinstance(getattr(callback, "__self__", None), runner._FullArchiveHandler)
+        for callback, _event in handlers
+    )
+    assert "Full archive live capture disabled" in caplog.text
+    assert "hidden shard data" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_run_daemon_does_not_register_full_archive_handler_when_disabled(
+    monkeypatch, tmp_path: Path
+):
+    config = replace(
+        build_config(tmp_path),
+        notifications=NotificationConfig(
+            bark_key=None,
+            heartbeat_interval_hours=0,
+            check_updates=False,
+        ),
+    )
+    handlers = []
+
+    class DummyClient:
+        def add_event_handler(self, callback, event):
+            handlers.append((callback, event))
+
+        async def get_me(self):
+            return SimpleNamespace(id=42, username="me")
+
+        async def disconnect(self):
+            return None
+
+    async def fake_start_client(_client, _role):
+        return None
+
+    async def fake_run_with_reconnect(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(runner, "_build_client", lambda _config: DummyClient())
+    monkeypatch.setattr(runner, "_start_client", fake_start_client)
+    monkeypatch.setattr(runner, "_run_with_reconnect", fake_run_with_reconnect)
+
+    await runner.run_daemon(config)
+
+    assert not any(
+        isinstance(getattr(callback, "__self__", None), runner._FullArchiveHandler)
+        for callback, _event in handlers
+    )
+
+
+@pytest.mark.asyncio
+async def test_archive_backfill_dry_run_scans_without_writing(
+    monkeypatch, tmp_path: Path
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    messages = [
+        make_archive_event_message(message_id=1, text="a"),
+        make_archive_event_message(message_id=2, text="b"),
+    ]
+
+    class DummyClient:
+        def iter_messages(self, chat_id, *, limit=None, offset_id=0, wait_time=None):
+            assert chat_id == config.full_archive.source_chat_id
+            assert limit == config.full_archive.backfill_limit_messages
+            assert offset_id == 0
+            assert wait_time == runner.ARCHIVE_BACKFILL_WAIT_TIME_SECONDS
+
+            async def gen():
+                for message in messages:
+                    yield message
+
+            return gen()
+
+        async def disconnect(self):
+            return None
+
+    async def fake_start_client(_client, _role):
+        return None
+
+    monkeypatch.setattr(runner, "_build_client", lambda _config: DummyClient())
+    monkeypatch.setattr(runner, "_start_client", fake_start_client)
+
+    stats = await runner.run_archive_backfill(config)
+
+    assert stats.scanned == 2
+    assert stats.matched == 2
+    assert stats.archived == 0
+    assert stats.dry_run is True
+    assert not config.full_archive.root_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_archive_backfill_zero_limit_is_noop_without_telegram(
+    monkeypatch, tmp_path: Path
+):
+    config = enable_full_archive(
+        build_config(tmp_path),
+        tmp_path,
+        backfill_limit_messages=0,
+    )
+
+    def fail_build_client(_config):
+        raise AssertionError("zero-limit backfill must not connect to Telegram")
+
+    monkeypatch.setattr(runner, "_build_client", fail_build_client)
+
+    stats = await runner.run_archive_backfill(config)
+
+    assert stats.scanned == 0
+    assert stats.matched == 0
+    assert stats.archived == 0
+    assert stats.linked == 0
+    assert stats.dry_run is True
+    assert not config.full_archive.root_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_archive_backfill_explicit_zero_limit_is_noop_without_telegram(
+    monkeypatch, tmp_path: Path
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+
+    def fail_build_client(_config):
+        raise AssertionError("zero-limit backfill must not connect to Telegram")
+
+    monkeypatch.setattr(runner, "_build_client", fail_build_client)
+
+    stats = await runner.run_archive_backfill(config, limit=0, apply=True)
+
+    assert stats.scanned == 0
+    assert stats.matched == 0
+    assert stats.archived == 0
+    assert stats.linked == 0
+    assert stats.dry_run is False
+    assert not config.full_archive.root_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_archive_backfill_apply_writes_archive_rows(monkeypatch, tmp_path: Path):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    messages = [
+        make_archive_event_message(message_id=1, text="a"),
+        make_archive_event_message(message_id=2, text="b"),
+    ]
+
+    class DummyClient:
+        def iter_messages(self, _chat_id, *, limit=None, offset_id=0, wait_time=None):
+            assert limit == 1
+            assert offset_id == 0
+            assert wait_time is None
+
+            async def gen():
+                for message in messages:
+                    yield message
+
+            return gen()
+
+        async def disconnect(self):
+            return None
+
+    async def fake_start_client(_client, _role):
+        return None
+
+    monkeypatch.setattr(runner, "_build_client", lambda _config: DummyClient())
+    monkeypatch.setattr(runner, "_start_client", fake_start_client)
+
+    stats = await runner.run_archive_backfill(config, limit=1, apply=True)
+
+    shard_path = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-05.sqlite3"
+    )
+    conn = sqlite3.connect(shard_path)
+    try:
+        count = conn.execute("SELECT COUNT(*) FROM archive_messages").fetchone()[0]
+    finally:
+        conn.close()
+
+    assert stats.scanned == 1
+    assert stats.matched == 1
+    assert stats.archived == 1
+    assert count == 1
+
+
+def test_archive_persist_recreates_archive_after_root_deletion(tmp_path: Path):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    first = runner._archive_message_from_telegram(
+        make_archive_event_message(message_id=1, text="before deletion")
+    )
+    assert first is not None
+    runner._persist_archive_message_to_storage(config, first, tracked_db_path=None)
+    assert (config.full_archive.root_dir / "manifest.sqlite3").exists()
+
+    shutil.rmtree(config.full_archive.root_dir)
+
+    second = runner._archive_message_from_telegram(
+        make_archive_event_message(message_id=2, text="after deletion")
+    )
+    assert second is not None
+    result = runner._persist_archive_message_to_storage(
+        config,
+        second,
+        tracked_db_path=None,
+    )
+
+    shard_path = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-05.sqlite3"
+    )
+    manifest = sqlite3.connect(config.full_archive.root_dir / "manifest.sqlite3")
+    try:
+        manifest_count = manifest.execute(
+            "SELECT SUM(message_count) FROM archive_shards"
+        ).fetchone()[0]
+    finally:
+        manifest.close()
+    shard = sqlite3.connect(shard_path)
+    try:
+        rows = shard.execute(
+            "SELECT message_id, text FROM archive_messages ORDER BY message_id"
+        ).fetchall()
+    finally:
+        shard.close()
+
+    assert result.created is True
+    assert manifest_count == 1
+    assert rows == [(2, "after deletion")]
+
+
+@pytest.mark.asyncio
+async def test_archive_backfill_apply_recreates_archive_after_root_deletion(
+    monkeypatch,
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    tracked_conn = storage.connect(config.storage.db_path)
+    try:
+        storage.ensure_schema(tracked_conn)
+        tracked_conn.execute(
+            """
+            INSERT INTO messages (
+                chat_id, message_id, sender_id, date, text
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                config.full_archive.source_chat_id,
+                900,
+                111,
+                "2026-05-01T11:00:00+00:00",
+                "tracked row must survive archive deletion",
+            ),
+        )
+        tracked_conn.commit()
+    finally:
+        tracked_conn.close()
+
+    batches = [
+        [make_archive_event_message(message_id=1, text="before deletion")],
+        [make_archive_event_message(message_id=2, text="after deletion")],
+    ]
+
+    class DummyClient:
+        def __init__(self, messages):
+            self.messages = messages
+
+        def iter_messages(self, _chat_id, *, limit=None, offset_id=0, wait_time=None):
+            assert limit == 1
+            assert offset_id == 0
+            assert wait_time is None
+
+            async def gen():
+                for message in self.messages:
+                    yield message
+
+            return gen()
+
+        async def disconnect(self):
+            return None
+
+    async def fake_start_client(_client, _role):
+        return None
+
+    def fake_build_client(_config):
+        return DummyClient(batches.pop(0))
+
+    monkeypatch.setattr(runner, "_build_client", fake_build_client)
+    monkeypatch.setattr(runner, "_start_client", fake_start_client)
+
+    first = await runner.run_archive_backfill(config, limit=1, apply=True)
+    assert (config.full_archive.root_dir / "manifest.sqlite3").exists()
+
+    shutil.rmtree(config.full_archive.root_dir)
+
+    tracked_conn = sqlite3.connect(config.storage.db_path)
+    try:
+        tracked_text = tracked_conn.execute(
+            "SELECT text FROM messages WHERE chat_id = ? AND message_id = ?",
+            (config.full_archive.source_chat_id, 900),
+        ).fetchone()[0]
+    finally:
+        tracked_conn.close()
+
+    second = await runner.run_archive_backfill(config, limit=1, apply=True)
+
+    manifest = sqlite3.connect(config.full_archive.root_dir / "manifest.sqlite3")
+    try:
+        manifest_count = manifest.execute(
+            "SELECT SUM(message_count) FROM archive_shards"
+        ).fetchone()[0]
+        shard_path = manifest.execute("SELECT path FROM archive_shards").fetchone()[0]
+    finally:
+        manifest.close()
+    shard = sqlite3.connect(config.full_archive.root_dir / shard_path)
+    try:
+        rows = shard.execute(
+            "SELECT message_id, text FROM archive_messages ORDER BY message_id"
+        ).fetchall()
+    finally:
+        shard.close()
+
+    assert first.archived == 1
+    assert second.archived == 1
+    assert tracked_text == "tracked row must survive archive deletion"
+    assert manifest_count == 1
+    assert rows == [(2, "after deletion")]
+
+
+@pytest.mark.asyncio
+async def test_archive_backfill_after_root_deletion_keeps_tracked_ref_dedup(
+    monkeypatch,
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    tracked_message = make_archive_event_message(
+        message_id=2,
+        sender_id=config.targets[0].tracked_user_ids[0],
+        text="archive duplicate candidate",
+        media=SimpleNamespace(document=SimpleNamespace(mime_type="image/png", size=123)),
+        file=SimpleNamespace(mime_type="image/png", size=123, name="chart.png"),
+    )
+    tracked = storage.connect(config.storage.db_path)
+    storage.ensure_schema(tracked)
+    try:
+        storage.persist_message(
+            tracked,
+            storage.StoredMessage(
+                chat_id=tracked_message.chat_id,
+                message_id=tracked_message.id,
+                sender_id=tracked_message.sender_id,
+                date=tracked_message.date,
+                text="tracked payload survives archive reset",
+                reply_to_msg_id=None,
+                replied_sender_id=None,
+                replied_date=None,
+                replied_text=None,
+            ),
+            [],
+        )
+    finally:
+        tracked.close()
+
+    batches = [
+        [make_archive_event_message(message_id=1, text="before deletion")],
+        [tracked_message],
+    ]
+
+    class DummyClient:
+        def __init__(self, messages):
+            self.messages = messages
+
+        def iter_messages(self, _chat_id, *, limit=None, offset_id=0, wait_time=None):
+            assert limit == 1
+            assert offset_id == 0
+            assert wait_time is None
+
+            async def gen():
+                for message in self.messages:
+                    yield message
+
+            return gen()
+
+        async def disconnect(self):
+            return None
+
+    async def fake_start_client(_client, _role):
+        return None
+
+    def fake_build_client(_config):
+        return DummyClient(batches.pop(0))
+
+    monkeypatch.setattr(runner, "_build_client", fake_build_client)
+    monkeypatch.setattr(runner, "_start_client", fake_start_client)
+
+    first = await runner.run_archive_backfill(config, limit=1, apply=True)
+    assert first.archived == 1
+
+    shutil.rmtree(config.full_archive.root_dir)
+
+    second = await runner.run_archive_backfill(config, limit=1, apply=True)
+
+    manifest = sqlite3.connect(config.full_archive.root_dir / "manifest.sqlite3")
+    try:
+        manifest_count = manifest.execute(
+            "SELECT SUM(message_count) FROM archive_shards"
+        ).fetchone()[0]
+        shard_path = manifest.execute("SELECT path FROM archive_shards").fetchone()[0]
+    finally:
+        manifest.close()
+    shard = sqlite3.connect(config.full_archive.root_dir / shard_path)
+    try:
+        row = shard.execute(
+            """
+            SELECT message_id, payload_mode, text, raw_text,
+                   tracked_message_chat_id, tracked_message_id
+            FROM archive_messages
+            """
+        ).fetchone()
+        archive_media_count = shard.execute(
+            "SELECT COUNT(*) FROM archive_media"
+        ).fetchone()[0]
+        link_count = shard.execute(
+            "SELECT COUNT(*) FROM archive_tracked_links"
+        ).fetchone()[0]
+    finally:
+        shard.close()
+
+    assert second.archived == 0
+    assert second.linked == 1
+    assert manifest_count == 1
+    assert tuple(row) == (
+        2,
+        "tracked_ref",
+        None,
+        None,
+        tracked_message.chat_id,
+        tracked_message.id,
+    )
+    assert archive_media_count == 0
+    assert link_count == 1
+
+
+@pytest.mark.asyncio
+async def test_archive_backfill_skips_invalid_message_and_continues(
+    monkeypatch,
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    invalid = SimpleNamespace(
+        id="not-a-message-id",
+        chat_id=config.full_archive.source_chat_id,
+        sender_id=999,
+        date=datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc),
+        message="bad",
+        raw_text="bad",
+        media=None,
+        file=None,
+        action=None,
+        reply_to=None,
+        reply_to_msg_id=None,
+    )
+    invalid_date = SimpleNamespace(
+        id=1,
+        chat_id=config.full_archive.source_chat_id,
+        sender_id=999,
+        date="not-a-datetime",
+        message="bad date",
+        raw_text="bad date",
+        media=None,
+        file=None,
+        action=None,
+        reply_to=None,
+        reply_to_msg_id=None,
+    )
+    valid = make_archive_event_message(message_id=2, text="after invalid")
+
+    class DummyClient:
+        def iter_messages(self, _chat_id, *, limit=None, offset_id=0, wait_time=None):
+            assert limit == 3
+            assert offset_id == 0
+            assert wait_time is None
+
+            async def gen():
+                yield invalid
+                yield invalid_date
+                yield valid
+
+            return gen()
+
+        async def disconnect(self):
+            return None
+
+    async def fake_start_client(_client, _role):
+        return None
+
+    monkeypatch.setattr(runner, "_build_client", lambda _config: DummyClient())
+    monkeypatch.setattr(runner, "_start_client", fake_start_client)
+
+    stats = await runner.run_archive_backfill(config, limit=3, apply=True)
+
+    manifest = sqlite3.connect(config.full_archive.root_dir / "manifest.sqlite3")
+    try:
+        manifest_message_count = manifest.execute(
+            "SELECT SUM(message_count) FROM archive_shards"
+        ).fetchone()[0]
+        shard_path = manifest.execute("SELECT path FROM archive_shards").fetchone()[0]
+    finally:
+        manifest.close()
+    shard = sqlite3.connect(config.full_archive.root_dir / shard_path)
+    try:
+        row = shard.execute(
+            "SELECT message_id, text FROM archive_messages"
+        ).fetchone()
+    finally:
+        shard.close()
+
+    assert stats.scanned == 3
+    assert stats.skipped_invalid == 2
+    assert stats.matched == 1
+    assert stats.archived == 1
+    assert manifest_message_count == 1
+    assert tuple(row) == (2, "after invalid")
+
+
+@pytest.mark.asyncio
+async def test_archive_backfill_apply_persists_service_messages_without_text(
+    monkeypatch,
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    service_message = make_archive_event_message(
+        message_id=1,
+        text="",
+        action=SimpleNamespace(type="pin"),
+    )
+
+    class DummyClient:
+        def iter_messages(self, _chat_id, *, limit=None, offset_id=0, wait_time=None):
+            assert limit == 1
+            assert offset_id == 0
+            assert wait_time is None
+
+            async def gen():
+                yield service_message
+
+            return gen()
+
+        async def disconnect(self):
+            return None
+
+    async def fake_start_client(_client, _role):
+        return None
+
+    monkeypatch.setattr(runner, "_build_client", lambda _config: DummyClient())
+    monkeypatch.setattr(runner, "_start_client", fake_start_client)
+
+    stats = await runner.run_archive_backfill(config, limit=1, apply=True)
+
+    manifest = sqlite3.connect(config.full_archive.root_dir / "manifest.sqlite3")
+    try:
+        shard_path = manifest.execute("SELECT path FROM archive_shards").fetchone()[0]
+    finally:
+        manifest.close()
+    shard = sqlite3.connect(config.full_archive.root_dir / shard_path)
+    try:
+        row = shard.execute(
+            "SELECT message_id, message_kind, text, raw_text FROM archive_messages"
+        ).fetchone()
+    finally:
+        shard.close()
+
+    assert stats.scanned == 1
+    assert stats.matched == 1
+    assert stats.skipped_invalid == 0
+    assert stats.archived == 1
+    assert tuple(row) == (1, "service", "", "")
+
+
+@pytest.mark.asyncio
+async def test_archive_backfill_apply_is_idempotent(monkeypatch, tmp_path: Path):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    message = make_archive_event_message(message_id=1, text="context")
+
+    class DummyClient:
+        def iter_messages(self, _chat_id, *, limit=None, offset_id=0, wait_time=None):
+            assert limit == 1
+            assert offset_id == 0
+            assert wait_time is None
+
+            async def gen():
+                yield message
+
+            return gen()
+
+        async def disconnect(self):
+            return None
+
+    async def fake_start_client(_client, _role):
+        return None
+
+    monkeypatch.setattr(runner, "_build_client", lambda _config: DummyClient())
+    monkeypatch.setattr(runner, "_start_client", fake_start_client)
+
+    first = await runner.run_archive_backfill(config, limit=1, apply=True)
+    second = await runner.run_archive_backfill(config, limit=1, apply=True)
+
+    manifest = sqlite3.connect(config.full_archive.root_dir / "manifest.sqlite3")
+    try:
+        manifest_message_count = manifest.execute(
+            "SELECT SUM(message_count) FROM archive_shards"
+        ).fetchone()[0]
+        tracked_db_link_count = manifest.execute(
+            "SELECT COUNT(*) FROM tracked_db_links WHERE status = 'active'"
+        ).fetchone()[0]
+        shard_path = manifest.execute("SELECT path FROM archive_shards").fetchone()[0]
+    finally:
+        manifest.close()
+    shard = sqlite3.connect(config.full_archive.root_dir / shard_path)
+    try:
+        archive_row_count = shard.execute(
+            "SELECT COUNT(*) FROM archive_messages"
+        ).fetchone()[0]
+    finally:
+        shard.close()
+
+    assert first.scanned == second.scanned == 1
+    assert first.matched == second.matched == 1
+    assert first.archived == 1
+    assert first.updated == 0
+    assert second.archived == 0
+    assert second.linked == 0
+    assert second.updated == 1
+    assert archive_row_count == 1
+    assert manifest_message_count == 1
+    assert tracked_db_link_count == 1
+
+
+@pytest.mark.asyncio
+async def test_archive_backfill_counts_first_tracked_ref_as_tracked_link(
+    monkeypatch,
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    message = make_archive_event_message(
+        message_id=1,
+        sender_id=config.targets[0].tracked_user_ids[0],
+        text="duplicate archive candidate",
+    )
+    tracked = storage.connect(config.storage.db_path)
+    storage.ensure_schema(tracked)
+    try:
+        storage.persist_message(
+            tracked,
+            storage.StoredMessage(
+                chat_id=message.chat_id,
+                message_id=message.id,
+                sender_id=message.sender_id,
+                date=message.date,
+                text="tracked payload",
+                reply_to_msg_id=None,
+                replied_sender_id=None,
+                replied_date=None,
+                replied_text=None,
+            ),
+            [],
+        )
+    finally:
+        tracked.close()
+
+    class DummyClient:
+        def iter_messages(self, _chat_id, *, limit=None, offset_id=0, wait_time=None):
+            assert limit == 1
+            assert offset_id == 0
+            assert wait_time is None
+
+            async def gen():
+                yield message
+
+            return gen()
+
+        async def disconnect(self):
+            return None
+
+    async def fake_start_client(_client, _role):
+        return None
+
+    monkeypatch.setattr(runner, "_build_client", lambda _config: DummyClient())
+    monkeypatch.setattr(runner, "_start_client", fake_start_client)
+
+    stats = await runner.run_archive_backfill(config, limit=1, apply=True)
+
+    manifest = sqlite3.connect(config.full_archive.root_dir / "manifest.sqlite3")
+    try:
+        manifest_message_count = manifest.execute(
+            "SELECT SUM(message_count) FROM archive_shards"
+        ).fetchone()[0]
+        shard_path = manifest.execute("SELECT path FROM archive_shards").fetchone()[0]
+    finally:
+        manifest.close()
+    shard = sqlite3.connect(config.full_archive.root_dir / shard_path)
+    try:
+        row = shard.execute(
+            """
+            SELECT payload_mode, text, raw_text
+            FROM archive_messages
+            WHERE chat_id = ? AND message_id = ?
+            """,
+            (message.chat_id, message.id),
+        ).fetchone()
+        archive_row_count = shard.execute(
+            "SELECT COUNT(*) FROM archive_messages"
+        ).fetchone()[0]
+        link_count = shard.execute(
+            "SELECT COUNT(*) FROM archive_tracked_links"
+        ).fetchone()[0]
+    finally:
+        shard.close()
+
+    assert stats.scanned == 1
+    assert stats.matched == 1
+    assert stats.archived == 0
+    assert stats.updated == 0
+    assert stats.linked == 1
+    assert tuple(row) == ("tracked_ref", None, None)
+    assert archive_row_count == 1
+    assert manifest_message_count == 1
+    assert link_count == 1
+
+
+@pytest.mark.asyncio
+async def test_archive_backfill_counts_existing_archive_row_relink_as_tracked_link(
+    monkeypatch,
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    message = make_archive_event_message(
+        message_id=1,
+        sender_id=config.targets[0].tracked_user_ids[0],
+        text="context before tracked DB",
+    )
+
+    initial = runner._archive_message_from_telegram(message)
+    assert initial is not None
+    runner._persist_archive_message_to_storage(
+        config,
+        initial,
+        tracked_db_path=config.storage.db_path,
+    )
+
+    tracked = storage.connect(config.storage.db_path)
+    storage.ensure_schema(tracked)
+    try:
+        storage.persist_message(
+            tracked,
+            storage.StoredMessage(
+                chat_id=message.chat_id,
+                message_id=message.id,
+                sender_id=message.sender_id,
+                date=message.date,
+                text="tracked payload",
+                reply_to_msg_id=None,
+                replied_sender_id=None,
+                replied_date=None,
+                replied_text=None,
+            ),
+            [],
+        )
+    finally:
+        tracked.close()
+
+    class DummyClient:
+        def iter_messages(self, _chat_id, *, limit=None, offset_id=0, wait_time=None):
+            assert limit == 1
+            assert offset_id == 0
+            assert wait_time is None
+
+            async def gen():
+                yield message
+
+            return gen()
+
+        async def disconnect(self):
+            return None
+
+    async def fake_start_client(_client, _role):
+        return None
+
+    monkeypatch.setattr(runner, "_build_client", lambda _config: DummyClient())
+    monkeypatch.setattr(runner, "_start_client", fake_start_client)
+
+    stats = await runner.run_archive_backfill(config, limit=1, apply=True)
+
+    manifest = sqlite3.connect(config.full_archive.root_dir / "manifest.sqlite3")
+    try:
+        manifest_message_count = manifest.execute(
+            "SELECT SUM(message_count) FROM archive_shards"
+        ).fetchone()[0]
+        shard_path = manifest.execute("SELECT path FROM archive_shards").fetchone()[0]
+    finally:
+        manifest.close()
+    shard = sqlite3.connect(config.full_archive.root_dir / shard_path)
+    try:
+        row = shard.execute(
+            """
+            SELECT payload_mode, text, raw_text
+            FROM archive_messages
+            WHERE chat_id = ? AND message_id = ?
+            """,
+            (message.chat_id, message.id),
+        ).fetchone()
+        archive_row_count = shard.execute(
+            "SELECT COUNT(*) FROM archive_messages"
+        ).fetchone()[0]
+        link_count = shard.execute(
+            "SELECT COUNT(*) FROM archive_tracked_links"
+        ).fetchone()[0]
+    finally:
+        shard.close()
+
+    assert stats.scanned == 1
+    assert stats.matched == 1
+    assert stats.archived == 0
+    assert stats.updated == 0
+    assert stats.linked == 1
+    assert tuple(row) == ("tracked_ref", None, None)
+    assert archive_row_count == 1
+    assert manifest_message_count == 1
+    assert link_count == 1
+
+
+@pytest.mark.asyncio
+async def test_archive_backfill_topic_scope_matches_live_capture(
+    monkeypatch, tmp_path: Path
+):
+    config = enable_full_archive(
+        build_config(tmp_path),
+        tmp_path,
+        capture_scope="topics",
+        topic_ids=(10,),
+    )
+    messages = [
+        make_archive_event_message(message_id=1, topic_id=10),
+        make_archive_event_message(message_id=2, topic_id=20),
+        make_archive_event_message(message_id=3, text="general or unknown topic"),
+    ]
+
+    class DummyClient:
+        def iter_messages(self, _chat_id, *, limit=None, offset_id=0, wait_time=None):
+            assert offset_id == 0
+            assert wait_time == runner.ARCHIVE_BACKFILL_WAIT_TIME_SECONDS
+
+            async def gen():
+                for message in messages:
+                    yield message
+
+            return gen()
+
+        async def disconnect(self):
+            return None
+
+    async def fake_start_client(_client, _role):
+        return None
+
+    monkeypatch.setattr(runner, "_build_client", lambda _config: DummyClient())
+    monkeypatch.setattr(runner, "_start_client", fake_start_client)
+
+    stats = await runner.run_archive_backfill(config, apply=True)
+
+    assert stats.scanned == 3
+    assert stats.matched == 1
+    assert stats.skipped_scope == 2
+
+    manifest = sqlite3.connect(config.full_archive.root_dir / "manifest.sqlite3")
+    try:
+        shard_path = manifest.execute("SELECT path FROM archive_shards").fetchone()[0]
+    finally:
+        manifest.close()
+    shard = sqlite3.connect(config.full_archive.root_dir / shard_path)
+    try:
+        rows = shard.execute(
+            "SELECT message_id, topic_id FROM archive_messages ORDER BY message_id"
+        ).fetchall()
+    finally:
+        shard.close()
+
+    assert [tuple(row) for row in rows] == [(1, 10)]
+
+
+@pytest.mark.asyncio
+async def test_archive_backfill_resumes_after_floodwait(
+    monkeypatch, tmp_path: Path
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    first = make_archive_event_message(message_id=10, text="newer")
+    second = make_archive_event_message(message_id=9, text="older")
+    calls: list[tuple[int | None, int, float | None]] = []
+    sleeps: list[float] = []
+
+    class DummyClient:
+        def iter_messages(self, _chat_id, *, limit=None, offset_id=0, wait_time=None):
+            calls.append((limit, offset_id, wait_time))
+
+            async def gen():
+                if len(calls) == 1:
+                    yield first
+                    raise errors.FloodWaitError(None, 0)
+                yield second
+
+            return gen()
+
+        async def disconnect(self):
+            return None
+
+    async def fake_start_client(_client, _role):
+        return None
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(runner, "_build_client", lambda _config: DummyClient())
+    monkeypatch.setattr(runner, "_start_client", fake_start_client)
+    monkeypatch.setattr(runner.asyncio, "sleep", fake_sleep)
+
+    stats = await runner.run_archive_backfill(config, limit=2)
+
+    assert calls == [
+        (2, 0, None),
+        (1, 10, runner.ARCHIVE_BACKFILL_WAIT_TIME_SECONDS),
+    ]
+    assert sleeps == [1]
+    assert stats.scanned == 2
+    assert stats.matched == 2
+    assert stats.dry_run is True
+    assert not config.full_archive.root_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_archive_backfill_apply_after_floodwait_keeps_counts_exact(
+    monkeypatch,
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    first = make_archive_event_message(message_id=10, text="newer")
+    second = make_archive_event_message(message_id=9, text="older")
+    calls: list[tuple[int | None, int, float | None]] = []
+
+    class DummyClient:
+        def iter_messages(self, _chat_id, *, limit=None, offset_id=0, wait_time=None):
+            calls.append((limit, offset_id, wait_time))
+
+            async def gen():
+                if len(calls) == 1:
+                    yield first
+                    raise errors.FloodWaitError(None, 0)
+                yield second
+
+            return gen()
+
+        async def disconnect(self):
+            return None
+
+    async def fake_start_client(_client, _role):
+        return None
+
+    async def fake_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(runner, "_build_client", lambda _config: DummyClient())
+    monkeypatch.setattr(runner, "_start_client", fake_start_client)
+    monkeypatch.setattr(runner.asyncio, "sleep", fake_sleep)
+
+    stats = await runner.run_archive_backfill(config, limit=2, apply=True)
+
+    manifest = sqlite3.connect(config.full_archive.root_dir / "manifest.sqlite3")
+    try:
+        manifest_message_count = manifest.execute(
+            "SELECT SUM(message_count) FROM archive_shards"
+        ).fetchone()[0]
+        shard_path = manifest.execute("SELECT path FROM archive_shards").fetchone()[0]
+    finally:
+        manifest.close()
+    shard = sqlite3.connect(config.full_archive.root_dir / shard_path)
+    try:
+        archive_rows = shard.execute(
+            "SELECT message_id, text FROM archive_messages ORDER BY message_id DESC"
+        ).fetchall()
+    finally:
+        shard.close()
+
+    assert calls == [
+        (2, 0, None),
+        (1, 10, runner.ARCHIVE_BACKFILL_WAIT_TIME_SECONDS),
+    ]
+    assert stats.scanned == 2
+    assert stats.matched == 2
+    assert stats.archived == 2
+    assert stats.updated == 0
+    assert manifest_message_count == 2
+    assert [tuple(row) for row in archive_rows] == [(10, "newer"), (9, "older")]
+
+
+@pytest.mark.asyncio
+async def test_archive_backfill_requires_full_archive_enabled(tmp_path: Path):
+    with pytest.raises(ValueError):
+        await runner.run_archive_backfill(build_config(tmp_path), apply=True)
+
+
+@pytest.mark.asyncio
+async def test_list_topics_fetches_forum_topics(monkeypatch, tmp_path: Path):
+    config = build_config(tmp_path)
+    requests = []
+
+    class DummyClient:
+        async def get_input_entity(self, chat):
+            assert chat == -100123
+            return "input-peer"
+
+        async def __call__(self, request):
+            requests.append(request)
+            return SimpleNamespace(
+                topics=[
+                    SimpleNamespace(
+                        id=10,
+                        title="FLT",
+                        top_message=10,
+                        unread_count=2,
+                        closed=False,
+                        hidden=False,
+                        pinned=True,
+                    ),
+                    SimpleNamespace(id=20, title="雅克科技", top_message=20),
+                    SimpleNamespace(id=30),
+                ]
+            )
+
+        async def disconnect(self):
+            return None
+
+    async def fake_start_client(_client, _role):
+        return None
+
+    monkeypatch.setattr(runner, "_build_client", lambda _config: DummyClient())
+    monkeypatch.setattr(runner, "_start_client", fake_start_client)
+
+    topics = await runner.run_list_topics(
+        config,
+        chat=-100123,
+        limit=50,
+        query="FLT",
+    )
+
+    assert len(requests) == 1
+    assert requests[0].peer == "input-peer"
+    assert requests[0].limit == 50
+    assert requests[0].q == "FLT"
+    assert [(topic.topic_id, topic.title, topic.pinned) for topic in topics] == [
+        (10, "FLT", True),
+        (20, "雅克科技", False),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_topics_rejects_invalid_limit(tmp_path: Path):
+    with pytest.raises(ValueError):
+        await runner.run_list_topics(build_config(tmp_path), chat=-100123, limit=0)
+
+
+@pytest.mark.asyncio
+async def test_list_topics_wraps_rpc_errors(monkeypatch, tmp_path: Path):
+    config = build_config(tmp_path)
+
+    class DummyClient:
+        async def get_input_entity(self, _chat):
+            raise runner.errors.UsernameInvalidError(request=None)
+
+        async def disconnect(self):
+            return None
+
+    async def fake_start_client(_client, _role):
+        return None
+
+    monkeypatch.setattr(runner, "_build_client", lambda _config: DummyClient())
+    monkeypatch.setattr(runner, "_start_client", fake_start_client)
+
+    with pytest.raises(ValueError, match="Cannot list topics"):
+        await runner.run_list_topics(config, chat="bad-chat")
+
+
+@pytest.mark.asyncio
+async def test_list_topics_wraps_entity_lookup_errors(monkeypatch, tmp_path: Path):
+    config = build_config(tmp_path)
+    disconnected = False
+
+    class DummyClient:
+        async def get_input_entity(self, _chat):
+            raise ValueError("Cannot find any entity")
+
+        async def disconnect(self):
+            nonlocal disconnected
+            disconnected = True
+
+    async def fake_start_client(_client, _role):
+        return None
+
+    monkeypatch.setattr(runner, "_build_client", lambda _config: DummyClient())
+    monkeypatch.setattr(runner, "_start_client", fake_start_client)
+
+    with pytest.raises(ValueError, match="Cannot list topics"):
+        await runner.run_list_topics(config, chat="bad-chat")
+    assert disconnected is True
+
+
+@pytest.mark.asyncio
+async def test_list_topics_wraps_api_signature_errors(monkeypatch, tmp_path: Path):
+    config = build_config(tmp_path)
+    disconnected = False
+
+    class DummyClient:
+        async def get_input_entity(self, chat):
+            assert chat == -100123
+            return "input-peer"
+
+        async def disconnect(self):
+            nonlocal disconnected
+            disconnected = True
+
+    async def fake_start_client(_client, _role):
+        return None
+
+    def broken_get_forum_topics_request(**_kwargs):
+        raise TypeError("unexpected keyword argument")
+
+    monkeypatch.setattr(runner, "_build_client", lambda _config: DummyClient())
+    monkeypatch.setattr(runner, "_start_client", fake_start_client)
+    monkeypatch.setattr(
+        runner.functions.messages,
+        "GetForumTopicsRequest",
+        broken_get_forum_topics_request,
+    )
+
+    with pytest.raises(ValueError, match="Cannot list topics"):
+        await runner.run_list_topics(config, chat=-100123)
+    assert disconnected is True
+
+
+@pytest.mark.asyncio
+async def test_list_topics_wraps_missing_api_errors(monkeypatch, tmp_path: Path):
+    config = build_config(tmp_path)
+    disconnected = False
+
+    class DummyClient:
+        async def get_input_entity(self, chat):
+            assert chat == -100123
+            return "input-peer"
+
+        async def disconnect(self):
+            nonlocal disconnected
+            disconnected = True
+
+    async def fake_start_client(_client, _role):
+        return None
+
+    class MissingForumTopics:
+        def __getattr__(self, name):
+            if name == "GetForumTopicsRequest":
+                raise AttributeError(name)
+            raise AttributeError(name)
+
+    monkeypatch.setattr(runner, "_build_client", lambda _config: DummyClient())
+    monkeypatch.setattr(runner, "_start_client", fake_start_client)
+    monkeypatch.setattr(runner.functions, "messages", MissingForumTopics())
+
+    with pytest.raises(ValueError, match="Cannot list topics"):
+        await runner.run_list_topics(config, chat=-100123)
+    assert disconnected is True
 
 
 @pytest.mark.asyncio

@@ -4,6 +4,11 @@
 
 > 條目按時間由新到舊排列，最新版本在最上方。每條變更都會標註對應的需求編號。
 
+## 1.8.0 — 2026-06-02
+- 新增可選的全量訊息歸檔儲存：telegram-watch 現在可以在獨立的 SQLite manifest/shard 體系中保存整個群組或指定 Topic 的本機上下文副本，同時保持既有 tracked-user 通知與報告邏輯不變。
+- 全量歸檔中的 tracked 訊息會透過 `tracked_ref` 連回現有 tracked 資料庫，避免重複保存被追蹤訊息本文和媒體 metadata，同時保留足夠時間線資訊供後續 `archive-context` 查詢使用。
+- 新增全量歸檔維運指令：`archive-backfill`、`archive-status`、`archive-repair`、`archive-context`、`list-topics`、`archive-qa-init`，並提供預設關閉設定、降級狀態啟動攔截、修復診斷，以及 gitignored 的真實 Telegram QA 證據範本。
+
 ## 1.7.0 — 2026-04-14
 - 新增全域訊息範本切換，對**所有轉發到控制群的單條訊息**生效——無論 `interval` 模式（每次定時彙總後逐條轉發）還是 `realtime` 模式（即時推送），均按所選範本呈現。在「顯示與通知」中可於 `Normal`（標準）與 `Minimal`（極簡）之間選擇。極簡範本將發送者與本文合併到第一行，時間下移到第二行；標準範本維持原本分行版面。GUI 端新增即時預覽面板，可直觀對比兩種版面。ID 顯示、時間格式、語言等既有自訂項目均疊加生效；舊設定檔缺少 `display.template` 鍵時自動回退為 `normal`，無需手動遷移。
 - 重新整理「顯示與通知」設定區，拆分為「訊息範本 / 訊息欄位 / 語言 / 通知」四個子分組，相關選項集中呈現。
