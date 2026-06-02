@@ -402,6 +402,41 @@ def test_select_shard_rotates_by_message_count(tmp_path):
     assert second.path.name == "2026-05-002.sqlite3"
 
 
+def test_select_shard_allocates_after_max_existing_sequence(tmp_path):
+    manifest = archive_storage.connect(tmp_path / "manifest.sqlite3")
+    root_dir = tmp_path / "full_archive"
+    for day in (1, 2, 3):
+        shard = archive_storage.select_shard(
+            manifest,
+            root_dir,
+            chat_id=-1001,
+            message_date=datetime(2026, 5, day, tzinfo=timezone.utc),
+            max_messages_per_shard=1,
+            max_shard_size_bytes=1024 * 1024,
+        )
+        manifest.execute(
+            "UPDATE archive_shards SET message_count = 1 WHERE shard_id = ?",
+            (shard.shard_id,),
+        )
+    manifest.execute(
+        "DELETE FROM archive_shards WHERE shard_id = ?",
+        ("-1001:2026-05:002",),
+    )
+
+    next_shard = archive_storage.select_shard(
+        manifest,
+        root_dir,
+        chat_id=-1001,
+        message_date=datetime(2026, 5, 4, tzinfo=timezone.utc),
+        max_messages_per_shard=1,
+        max_shard_size_bytes=1024 * 1024,
+    )
+
+    assert next_shard.sequence == 4
+    assert next_shard.shard_id == "-1001:2026-05:004"
+    assert next_shard.path.name == "2026-05-004.sqlite3"
+
+
 def test_select_shard_rotates_by_file_size(tmp_path):
     manifest = archive_storage.connect(tmp_path / "manifest.sqlite3")
     root_dir = tmp_path / "full_archive"
@@ -583,6 +618,24 @@ def test_persist_archive_message_upserts_existing_row(tmp_path):
     )
     assert len(rows) == 1
     assert rows[0].text == "after"
+
+
+def test_persist_archive_message_with_result_reports_created_state(tmp_path):
+    shard = archive_storage.connect(tmp_path / "archive.sqlite3")
+
+    first = archive_storage.persist_archive_message_with_result(
+        shard,
+        archive_message(1, text="before"),
+    )
+    second = archive_storage.persist_archive_message_with_result(
+        shard,
+        archive_message(1, text="after"),
+    )
+
+    assert first.payload_mode == "archive"
+    assert first.created is True
+    assert second.payload_mode == "archive"
+    assert second.created is False
 
 
 def test_tracked_message_is_stored_as_link_without_duplicate_text(tmp_path):

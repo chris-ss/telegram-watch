@@ -895,7 +895,7 @@ def test_archive_persist_does_not_record_tracked_db_link_when_shard_write_fails(
     def fail_persist(*_args, **_kwargs):
         raise sqlite3.OperationalError("disk full")
 
-    monkeypatch.setattr(runner, "persist_archive_message", fail_persist)
+    monkeypatch.setattr(runner, "persist_archive_message_with_result", fail_persist)
 
     with pytest.raises(sqlite3.OperationalError, match="disk full"):
         runner._persist_archive_message_to_storage(
@@ -2028,6 +2028,52 @@ def test_archive_persist_recreates_archive_after_root_deletion(tmp_path: Path):
     assert result.created is True
     assert manifest_count == 1
     assert rows == [(2, "after deletion")]
+
+
+def test_archive_persist_does_not_increment_manifest_for_existing_message(
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    message = runner._archive_message_from_telegram(
+        make_archive_event_message(message_id=1, text="first")
+    )
+    duplicate = runner._archive_message_from_telegram(
+        make_archive_event_message(message_id=1, text="edited")
+    )
+    assert message is not None
+    assert duplicate is not None
+
+    first = runner._persist_archive_message_to_storage(
+        config,
+        message,
+        tracked_db_path=None,
+    )
+    second = runner._persist_archive_message_to_storage(
+        config,
+        duplicate,
+        tracked_db_path=None,
+    )
+
+    manifest = sqlite3.connect(config.full_archive.root_dir / "manifest.sqlite3")
+    try:
+        manifest_count = manifest.execute(
+            "SELECT SUM(message_count) FROM archive_shards"
+        ).fetchone()[0]
+        shard_path = manifest.execute("SELECT path FROM archive_shards").fetchone()[0]
+    finally:
+        manifest.close()
+    shard = sqlite3.connect(config.full_archive.root_dir / shard_path)
+    try:
+        rows = shard.execute(
+            "SELECT message_id, text FROM archive_messages ORDER BY message_id"
+        ).fetchall()
+    finally:
+        shard.close()
+
+    assert first.created is True
+    assert second.created is False
+    assert manifest_count == 1
+    assert rows == [(1, "edited")]
 
 
 @pytest.mark.asyncio

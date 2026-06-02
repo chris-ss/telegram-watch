@@ -57,6 +57,12 @@ class ArchiveShard:
     sequence: int
 
 
+@dataclass(frozen=True)
+class ArchiveMessagePersistResult:
+    payload_mode: str
+    created: bool
+
+
 @dataclass
 class DbArchiveMessage:
     chat_id: int
@@ -404,7 +410,11 @@ def select_shard(
                 (_serialize_dt(_utc_now()), file_size, row["shard_id"]),
             )
 
-    sequence = len(rows) + 1
+    max_sequence = max(
+        (_row_to_shard(row, root_dir).sequence for row in rows),
+        default=0,
+    )
+    sequence = max_sequence + 1
     shard = _build_shard(root_dir, chat_id, starts_at, ends_at, sequence)
     shard.path.parent.mkdir(parents=True, exist_ok=True)
     now = _serialize_dt(_utc_now())
@@ -453,17 +463,65 @@ def persist_archive_message(
     archive_root_dir: Path | None = None,
 ) -> str:
     """Persist an archive message and return its payload mode."""
+    result = persist_archive_message_with_result(
+        conn,
+        message,
+        tracked_db_path=tracked_db_path,
+        archive_root_dir=archive_root_dir,
+    )
+    return result.payload_mode
+
+
+def persist_archive_message_with_result(
+    conn: sqlite3.Connection,
+    message: ArchiveMessage,
+    *,
+    tracked_db_path: Path | None = None,
+    archive_root_dir: Path | None = None,
+) -> ArchiveMessagePersistResult:
+    """Persist an archive message and report whether it inserted a new row."""
     ensure_shard_schema(conn)
-    existing = conn.execute(
-        """
-        SELECT payload_mode, tracked_db_path, tracked_message_chat_id,
-               tracked_message_id
-        FROM archive_messages
-        WHERE chat_id = ? AND message_id = ?
-        LIMIT 1
-        """,
-        (message.chat_id, message.message_id),
-    ).fetchone()
+    started_transaction = not conn.in_transaction
+    if started_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        existing = conn.execute(
+            """
+            SELECT payload_mode, tracked_db_path, tracked_message_chat_id,
+                   tracked_message_id
+            FROM archive_messages
+            WHERE chat_id = ? AND message_id = ?
+            LIMIT 1
+            """,
+            (message.chat_id, message.message_id),
+        ).fetchone()
+        created = existing is None
+        result = _persist_archive_message_in_transaction(
+            conn,
+            message,
+            existing=existing,
+            tracked_db_path=tracked_db_path,
+            archive_root_dir=archive_root_dir,
+            created=created,
+        )
+    except Exception:
+        if started_transaction:
+            conn.rollback()
+        raise
+    if started_transaction:
+        conn.commit()
+    return result
+
+
+def _persist_archive_message_in_transaction(
+    conn: sqlite3.Connection,
+    message: ArchiveMessage,
+    *,
+    existing: sqlite3.Row | None,
+    tracked_db_path: Path | None,
+    archive_root_dir: Path | None,
+    created: bool,
+) -> ArchiveMessagePersistResult:
     tracked_path = (
         _tracked_db_path_value(archive_root_dir, tracked_db_path)
         if tracked_db_path
@@ -512,109 +570,108 @@ def persist_archive_message(
         now,
         now,
     )
-    with conn:
+    conn.execute(
+        """
+        INSERT INTO archive_messages (
+            chat_id, message_id, topic_id, sender_id, date, text, raw_text,
+            message_kind, reply_to_msg_id, reply_to_top_id, is_forum_topic_link,
+            has_media, tracked_db_path, tracked_message_chat_id,
+            tracked_message_id, payload_mode, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(chat_id, message_id) DO UPDATE SET
+            topic_id=excluded.topic_id,
+            sender_id=excluded.sender_id,
+            date=excluded.date,
+            text=excluded.text,
+            raw_text=excluded.raw_text,
+            message_kind=excluded.message_kind,
+            reply_to_msg_id=excluded.reply_to_msg_id,
+            reply_to_top_id=excluded.reply_to_top_id,
+            is_forum_topic_link=excluded.is_forum_topic_link,
+            has_media=excluded.has_media,
+            tracked_db_path=excluded.tracked_db_path,
+            tracked_message_chat_id=excluded.tracked_message_chat_id,
+            tracked_message_id=excluded.tracked_message_id,
+            payload_mode=excluded.payload_mode,
+            updated_at=excluded.updated_at
+        """,
+        values,
+    )
+    if payload_mode == "tracked_ref":
         conn.execute(
             """
-            INSERT INTO archive_messages (
-                chat_id, message_id, topic_id, sender_id, date, text, raw_text,
-                message_kind, reply_to_msg_id, reply_to_top_id, is_forum_topic_link,
-                has_media, tracked_db_path, tracked_message_chat_id,
-                tracked_message_id, payload_mode, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(chat_id, message_id) DO UPDATE SET
-                topic_id=excluded.topic_id,
-                sender_id=excluded.sender_id,
-                date=excluded.date,
-                text=excluded.text,
-                raw_text=excluded.raw_text,
-                message_kind=excluded.message_kind,
-                reply_to_msg_id=excluded.reply_to_msg_id,
-                reply_to_top_id=excluded.reply_to_top_id,
-                is_forum_topic_link=excluded.is_forum_topic_link,
-                has_media=excluded.has_media,
-                tracked_db_path=excluded.tracked_db_path,
-                tracked_message_chat_id=excluded.tracked_message_chat_id,
-                tracked_message_id=excluded.tracked_message_id,
-                payload_mode=excluded.payload_mode,
-                updated_at=excluded.updated_at
+            DELETE FROM archive_media
+            WHERE chat_id = ? AND message_id = ?
             """,
-            values,
+            (message.chat_id, message.message_id),
         )
-        if payload_mode == "tracked_ref":
+        if (
+            tracked_path is not None
+            and tracked_chat_id is not None
+            and tracked_message_id is not None
+        ):
             conn.execute(
                 """
-                DELETE FROM archive_media
-                WHERE chat_id = ? AND message_id = ?
+                INSERT INTO archive_tracked_links (
+                    chat_id, message_id, tracked_db_path, tracked_chat_id,
+                    tracked_message_id, linked_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id, message_id, tracked_db_path) DO UPDATE SET
+                    tracked_chat_id=excluded.tracked_chat_id,
+                    tracked_message_id=excluded.tracked_message_id,
+                    linked_at=excluded.linked_at
                 """,
-                (message.chat_id, message.message_id),
+                (
+                    message.chat_id,
+                    message.message_id,
+                    tracked_path,
+                    tracked_chat_id,
+                    tracked_message_id,
+                    now,
+                ),
             )
-            if (
-                tracked_path is not None
-                and tracked_chat_id is not None
-                and tracked_message_id is not None
-            ):
-                conn.execute(
-                    """
-                    INSERT INTO archive_tracked_links (
-                        chat_id, message_id, tracked_db_path, tracked_chat_id,
-                        tracked_message_id, linked_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(chat_id, message_id, tracked_db_path) DO UPDATE SET
-                        tracked_chat_id=excluded.tracked_chat_id,
-                        tracked_message_id=excluded.tracked_message_id,
-                        linked_at=excluded.linked_at
-                    """,
-                    (
-                        message.chat_id,
-                        message.message_id,
-                        tracked_path,
-                        tracked_chat_id,
-                        tracked_message_id,
-                        now,
-                    ),
-                )
-        else:
+    else:
+        conn.execute(
+            """
+            DELETE FROM archive_tracked_links
+            WHERE chat_id = ? AND message_id = ?
+            """,
+            (message.chat_id, message.message_id),
+        )
+        conn.execute(
+            """
+            DELETE FROM archive_media
+            WHERE chat_id = ? AND message_id = ?
+            """,
+            (message.chat_id, message.message_id),
+        )
+        for media in message.media:
             conn.execute(
                 """
-                DELETE FROM archive_tracked_links
-                WHERE chat_id = ? AND message_id = ?
+                INSERT INTO archive_media (
+                    chat_id, message_id, media_index, media_kind, mime_type,
+                    file_size, file_name, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id, message_id, media_index) DO UPDATE SET
+                    media_kind=excluded.media_kind,
+                    mime_type=excluded.mime_type,
+                    file_size=excluded.file_size,
+                    file_name=excluded.file_name,
+                    updated_at=excluded.updated_at
                 """,
-                (message.chat_id, message.message_id),
+                (
+                    message.chat_id,
+                    message.message_id,
+                    media.media_index,
+                    media.media_kind,
+                    media.mime_type,
+                    media.file_size,
+                    media.file_name,
+                    now,
+                    now,
+                ),
             )
-            conn.execute(
-                """
-                DELETE FROM archive_media
-                WHERE chat_id = ? AND message_id = ?
-                """,
-                (message.chat_id, message.message_id),
-            )
-            for media in message.media:
-                conn.execute(
-                    """
-                    INSERT INTO archive_media (
-                        chat_id, message_id, media_index, media_kind, mime_type,
-                        file_size, file_name, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(chat_id, message_id, media_index) DO UPDATE SET
-                        media_kind=excluded.media_kind,
-                        mime_type=excluded.mime_type,
-                        file_size=excluded.file_size,
-                        file_name=excluded.file_name,
-                        updated_at=excluded.updated_at
-                    """,
-                    (
-                        message.chat_id,
-                        message.message_id,
-                        media.media_index,
-                        media.media_kind,
-                        media.mime_type,
-                        media.file_size,
-                        media.file_name,
-                        now,
-                        now,
-                    ),
-                )
-    return payload_mode
+    return ArchiveMessagePersistResult(payload_mode=payload_mode, created=created)
 
 
 def archive_message_exists(

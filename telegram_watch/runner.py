@@ -33,6 +33,7 @@ from .full_archive_storage import (
     find_shard_for_message,
     inspect_archive_status,
     persist_archive_message,
+    persist_archive_message_with_result,
     record_tracked_db_link,
     record_shard_write,
     select_shard,
@@ -1252,15 +1253,16 @@ def _persist_archive_message_to_storage(
                 message_id=message.message_id,
             )
             existed = previous_payload_mode is not None
-            payload_mode = persist_archive_message(
+            persist_result = persist_archive_message_with_result(
                 shard_conn,
                 message,
                 tracked_db_path=tracked_db_path,
                 archive_root_dir=archive.root_dir,
             )
+            payload_mode = persist_result.payload_mode
         finally:
             shard_conn.close()
-        if not existed:
+        if persist_result.created:
             record_shard_write(manifest_conn, shard)
         if tracked_db_path is not None:
             record_tracked_db_link(
@@ -1274,7 +1276,7 @@ def _persist_archive_message_to_storage(
         )
         return ArchivePersistResult(
             payload_mode=payload_mode,
-            created=not existed,
+            created=persist_result.created,
             linked=linked,
         )
     finally:
