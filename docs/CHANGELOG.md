@@ -4,6 +4,11 @@
 
 > Entries are arranged from newest to oldest so the latest release notes stay at the top. Each bullet references the requirement(s) that introduced the change.
 
+## 1.8.0 — 2026-06-02
+- Add optional full-message archive storage: telegram-watch can now keep a local whole-group or selected-Topic context copy in a separate SQLite manifest/shard set while leaving tracked-user notifications and reports unchanged.
+- Link full-archive rows back to the existing tracked database with `tracked_ref` records, avoiding duplicate tracked message text/media metadata while preserving enough timeline context for later `archive-context` queries.
+- Add the full-archive operational surface: `archive-backfill`, `archive-status`, `archive-repair`, `archive-context`, `list-topics`, and `archive-qa-init`, with default-off config, degraded-state startup gating, repair diagnostics, and a gitignored real Telegram QA evidence template.
+
 ## 1.7.0 — 2026-04-14
 - Add a global message template selector with `Normal` / `Minimal` layouts for individual messages forwarded to the control chat. The selector applies in both interval mode (per-message forwards after each digest) and realtime mode (instant push) — wherever messages appear one-per-Telegram-message in the control chat. Minimal collapses sender and content onto the first line and moves the time to the second line, while Normal preserves the existing multi-line layout. A live preview in the GUI shows the current layout at a glance. Existing ID display, time format, and language preferences apply on top of the chosen template, and configs missing the new `display.template` key default to `normal` with no migration needed.
 - Reorganize the Display & Notifications panel into clearer subgroups — Message Template, Message Fields, Language, and Notifications — so related controls stay together.

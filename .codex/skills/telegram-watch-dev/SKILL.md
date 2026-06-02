@@ -1,61 +1,83 @@
 ---
 name: telegram-watch-dev
-description: Develop telegram-watch using a requirements-first workflow (Draft -> Approved -> Implementing -> Done) with minimal, testable changes.
+description: Develop telegram-watch using the current Todoist-backed project workflow, local-first safety rules, and minimal tested changes.
 metadata:
-  short-description: telegram-watch workflow-first development
+  short-description: telegram-watch Todoist workflow development
 ---
 
-When using this skill, ALWAYS follow this workflow:
+When using this skill, follow the repository instructions in `AGENTS.md` / `CLAUDE.md`. The current workflow is Todoist-backed; historical `docs/requests/**` files are reference only and must not be used for new work.
 
-0) Requirements workflow is mandatory (no exceptions)
-- Source of truth: `docs/requests/`
-- Intake: `docs/inbox.md`
-- Template: `docs/templates/REQ_TEMPLATE.md`
+## Source of truth
 
-1) Before coding: pick work from Approved requests
-- List `docs/requests/` and find requirements with `Status: Approved`.
-- If multiple exist, choose the lowest-numbered / smallest-scope one unless the user specifies an ID.
+- Todoist shared `Dev` project, filtered by the single `telegram-watch` label, is the only task state and progress-log source.
+- Do not create a standalone `telegram-watch` Todoist project.
+- Do not create or use `Bug`, `商业化`, or other category labels for this project.
+- Do not disturb sibling labels such as `CodexBar-Mobile` or `Telegram-Watch-Mac`; always filter by `telegram-watch`.
+- `docs/inbox.md` is only a rough idea pool. Mature work goes to Todoist Backlog.
+- `docs/requests/**`, `docs/templates/REQ_TEMPLATE.md`, and `docs/WORKFLOW.md` are historical archives only.
 
-2) If there is NO Approved request
-- Read `docs/inbox.md` (if present) and/or the user’s latest message.
-- Create ONE new Draft requirement file:
-  - Path: `docs/requests/REQ-YYYYMMDD-###-slug.md`
-  - Content: must follow `docs/templates/REQ_TEMPLATE.md`
-  - Set `Status: Draft`
-- STOP after creating the Draft and ask the user to approve it.
-- Do NOT implement anything until the user confirms approval (Status becomes Approved).
+## Before coding
 
-3) When starting implementation of an Approved request
-- Update the chosen REQ:
-  - `Status: Approved` -> `Status: Implementing`
-  - Add a short plan in the REQ (2–6 bullets max).
-- Implement the request strictly as written; avoid unrelated refactors.
+1. Search Todoist in the shared `Dev` project for relevant tasks with the `telegram-watch` label.
+2. If no task exists for a real feature/bug request, create one in Backlog with:
+   - content
+   - description
+   - labels=`["telegram-watch"]`
+   - priority=`p1` through `p4`
+   - Release Impact: proposed SemVer bump plus one English changelog sentence
+3. Move the task to In Progress before implementation.
+4. Work on one Todoist task at a time unless the user explicitly pauses or redirects.
 
-4) Build order for MVP code work
-- Implement in this order: `doctor` -> `once` -> `run`.
+## Implementation rules
 
-4.1) README localization rule
-- Any time you add or update content in `README.md`, you must apply the same change (or equivalent translation) to every localized README (`README.zh-Hans.md`, `README.zh-Hant.md`, `README.ja.md`). Language switch links at the top must also stay in sync.
+- Keep changes minimal and scoped to the task.
+- Preserve local-first behavior; do not add cloud dependencies unless explicitly approved.
+- Never print or commit secrets, phone numbers, `api_hash`, `*.session`, `config.toml`, `data/`, or `reports/`.
+- Respect Telegram rate limits and handle FloodWait/backoff where relevant.
+- For full archive work, keep it default-off and run/read `archive-status` as the local health gate; use `archive-qa-init` for the gitignored real Telegram QA record draft before claiming live end-to-end readiness.
+- If changing `README.md`, apply the equivalent change to:
+  - `docs/README.zh-Hans.md`
+  - `docs/README.zh-Hant.md`
+  - `docs/README.ja.md`
+- Build order for MVP behavior remains `doctor` -> `once` -> `run`.
 
-5) After each change set, run validations
-- python -m telegram_watch doctor --config config.toml
-- python -m telegram_watch once --config config.toml --since 10m
+## Validation
 
-6) Completion protocol
-- Ensure all Acceptance Criteria in the REQ and `ACCEPTANCE.md` are satisfied.
-- Update the REQ:
-  - Tick the acceptance checkboxes
-  - Add “What changed” (files touched + brief rationale)
-  - `Status: Implementing` -> `Status: Done`
+Run focused tests for the changed area. For normal development completion, prefer:
 
-7) Security / open-source hygiene (never violate)
-- Never print or commit secrets (api_hash, phone, session).
-- Ensure `.gitignore` excludes: `config.toml`, `*.session`, `data/`, `reports/`.
-- Keep data local by default; do not add cloud dependencies unless explicitly approved.
+```bash
+pytest tests/
+python -m tgwatch doctor --config config.toml
+python -m tgwatch archive-status --config config.toml
+python -m tgwatch once --config config.toml --since 10m
+```
 
-8) Commit protocol
-- When the user says “commit”, always include both a summary and a description in the commit message.
-- Use this format:
-  - `git commit -m "SUMMARY" -m "DETAILS"`
-  - SUMMARY: short, action-oriented, and specific.
-  - DETAILS: 2–6 bullets or sentences describing key changes, ordered by importance.
+If a command cannot be run because local credentials/config are unavailable, say that clearly and run the closest safe offline checks.
+
+## Completion workflow
+
+- When code is complete, move the Todoist task to Code Complete and add a short comment with the verification state.
+- QA / Release movement requires the user's confirmation after validation.
+- Do not mark Todoist tasks complete on your own; the user confirms completion.
+- Mirror actionable Todoist comments back in chat because chat is the primary user interface.
+
+## Versioning and changelog
+
+- Every Todoist task should include Release Impact.
+- On completion of release-impacting work, update `pyproject.toml` and prepend `docs/CHANGELOG.md`.
+- Patch: backward-compatible fixes/docs.
+- Minor: additive features or new config surfaces.
+- Major: breaking schema or CLI changes.
+- README `pip install ...@vX.Y.Z` examples change only after the GitHub tag exists.
+
+## Commit protocol
+
+When the user asks to commit:
+
+1. Commit with both summary and description:
+   ```bash
+   git commit -m "SUMMARY" -m "DETAILS"
+   ```
+2. Push immediately unless the user says otherwise.
+3. Add a Todoist comment with the commit link.
+4. Move the task to the appropriate board column.

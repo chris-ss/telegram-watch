@@ -309,6 +309,75 @@ def test_normalize_config_preserves_custom_time_format() -> None:
     assert data["display"]["time_format"] == "%B %-d, %Y %I:%M"
 
 
+def test_normalize_config_includes_full_archive_defaults() -> None:
+    data = _normalize_config({})
+
+    assert data["full_archive"] == {
+        "enabled": False,
+        "root_dir": "data/full_archive",
+        "source_chat_id": "",
+        "capture_scope": "whole_group",
+        "topic_ids": "",
+        "shard_policy": "monthly",
+        "max_messages_per_shard": 500000,
+        "max_shard_size_mb": 1024,
+        "backfill_limit_messages": 10000,
+    }
+
+
+def test_normalize_config_formats_full_archive_topic_ids() -> None:
+    data = _normalize_config(
+        {
+            "full_archive": {
+                "enabled": True,
+                "source_chat_id": -1001,
+                "capture_scope": "topics",
+                "topic_ids": [10, 20],
+            }
+        }
+    )
+
+    assert data["full_archive"]["topic_ids"] == "10, 20"
+
+
+def test_normalize_config_warns_when_full_archive_source_is_not_target() -> None:
+    data = _normalize_config(
+        {
+            "targets": [
+                {
+                    "target_chat_id": -1001,
+                    "tracked_user_ids": [123],
+                }
+            ],
+            "full_archive": {
+                "enabled": True,
+                "source_chat_id": -2002,
+            },
+        }
+    )
+
+    assert data["full_archive_source_warning"] is True
+
+
+def test_normalize_config_skips_full_archive_source_warning_when_matching_target() -> None:
+    data = _normalize_config(
+        {
+            "targets": [
+                {
+                    "target_chat_id": -1001,
+                    "tracked_user_ids": [123],
+                }
+            ],
+            "full_archive": {
+                "enabled": True,
+                "source_chat_id": -1001,
+            },
+        }
+    )
+
+    assert data["full_archive_source_warning"] is False
+
+
 def test_load_raw_config_reports_invalid_toml(tmp_path: Path) -> None:
     config_path = tmp_path / "config.toml"
     config_path.write_text("[telegram\napi_id = 42\n", encoding="utf-8")
@@ -436,6 +505,111 @@ def test_validate_payload_missing_template_defaults_to_normal() -> None:
     assert normalized["display"]["template"] == "normal"
 
 
+def test_validate_payload_accepts_full_archive_topics() -> None:
+    payload = _minimal_valid_payload()
+    payload["full_archive"] = {
+        "enabled": True,
+        "root_dir": "data/full_archive",
+        "source_chat_id": "-1001",
+        "capture_scope": "topics",
+        "topic_ids": "10, 20",
+        "shard_policy": "monthly",
+        "max_messages_per_shard": "500000",
+        "max_shard_size_mb": "1024",
+        "backfill_limit_messages": "100",
+    }
+
+    errors, normalized = _validate_payload(payload, {})
+
+    assert not errors
+    assert normalized["full_archive"]["enabled"] is True
+    assert normalized["full_archive"]["source_chat_id"] == -1001
+    assert normalized["full_archive"]["topic_ids"] == [10, 20]
+
+
+def test_validate_payload_rejects_reserved_full_archive_topic_ids() -> None:
+    payload = _minimal_valid_payload()
+    payload["full_archive"] = {
+        "enabled": True,
+        "root_dir": "data/full_archive",
+        "source_chat_id": "-1001",
+        "capture_scope": "topics",
+        "topic_ids": "0, 1, -1",
+        "shard_policy": "monthly",
+        "max_messages_per_shard": "500000",
+        "max_shard_size_mb": "1024",
+        "backfill_limit_messages": "100",
+    }
+
+    errors, normalized = _validate_payload(payload, {})
+
+    assert (
+        "full_archive.topic_ids values must be Telegram forum topic IDs > 1; "
+        "use whole_group for General"
+    ) in errors
+    assert "full_archive.topic_ids is required when capture_scope is 'topics'" in errors
+    assert normalized["full_archive"]["topic_ids"] == []
+
+
+def test_validate_payload_allows_disabled_topic_scope_draft_without_topics() -> None:
+    payload = _minimal_valid_payload()
+    payload["full_archive"] = {
+        "enabled": False,
+        "source_chat_id": "",
+        "capture_scope": "topics",
+        "topic_ids": "",
+    }
+
+    errors, normalized = _validate_payload(payload, {})
+
+    assert not errors
+    assert normalized["full_archive"]["enabled"] is False
+    assert normalized["full_archive"]["capture_scope"] == "topics"
+    assert normalized["full_archive"]["topic_ids"] == []
+
+
+def test_validate_payload_rejects_enabled_full_archive_without_source() -> None:
+    payload = _minimal_valid_payload()
+    payload["full_archive"] = {
+        "enabled": True,
+        "source_chat_id": "0",
+        "capture_scope": "whole_group",
+    }
+
+    errors, _normalized = _validate_payload(payload, {})
+
+    assert "full_archive.source_chat_id must not be 0" in errors
+
+
+def test_validate_payload_treats_string_false_full_archive_as_disabled() -> None:
+    payload = _minimal_valid_payload()
+    payload["full_archive"] = {
+        "enabled": "false",
+        "source_chat_id": "",
+        "capture_scope": "whole_group",
+    }
+
+    errors, normalized = _validate_payload(payload, {})
+
+    assert not errors
+    assert normalized["full_archive"]["enabled"] is False
+
+
+def test_validate_payload_preserves_zero_full_archive_backfill_limit() -> None:
+    payload = _minimal_valid_payload()
+    payload["full_archive"] = {
+        "enabled": False,
+        "source_chat_id": "",
+        "capture_scope": "whole_group",
+        "backfill_limit_messages": "0",
+    }
+
+    errors, normalized = _validate_payload(payload, {})
+
+    assert not errors
+    assert normalized["full_archive"]["backfill_limit_messages"] == 0
+
+
 def test_render_toml_writes_display_template() -> None:
     normalized = {
         "config_version": 1.0,
@@ -479,6 +653,58 @@ def test_render_toml_writes_display_template() -> None:
     assert parsed["display"]["template"] == "minimal"
 
 
+def test_render_toml_writes_full_archive() -> None:
+    normalized = _minimal_valid_payload()
+    errors, normalized = _validate_payload(normalized, {})
+    assert not errors
+    normalized["full_archive"] = {
+        "enabled": True,
+        "root_dir": "data/full_archive",
+        "source_chat_id": -1001,
+        "capture_scope": "topics",
+        "topic_ids": [10, 20],
+        "shard_policy": "monthly",
+        "max_messages_per_shard": 500000,
+        "max_shard_size_mb": 1024,
+        "backfill_limit_messages": 10000,
+    }
+
+    toml_text = _render_toml(normalized, {})
+    parsed = tomllib.loads(toml_text)
+
+    assert parsed["full_archive"]["enabled"] is True
+    assert parsed["full_archive"]["source_chat_id"] == -1001
+    assert parsed["full_archive"]["topic_ids"] == [10, 20]
+
+
+def test_render_toml_omits_empty_full_archive_source_chat_id() -> None:
+    payload = _minimal_valid_payload()
+    errors, normalized = _validate_payload(payload, {})
+    assert not errors
+
+    toml_text = _render_toml(normalized, {})
+    parsed = tomllib.loads(toml_text)
+
+    assert "source_chat_id" not in parsed["full_archive"]
+
+
+def test_render_toml_preserves_zero_full_archive_backfill_limit() -> None:
+    payload = _minimal_valid_payload()
+    payload["full_archive"] = {
+        "enabled": False,
+        "source_chat_id": "",
+        "capture_scope": "whole_group",
+        "backfill_limit_messages": "0",
+    }
+    errors, normalized = _validate_payload(payload, {})
+    assert not errors
+
+    toml_text = _render_toml(normalized, {})
+    parsed = tomllib.loads(toml_text)
+
+    assert parsed["full_archive"]["backfill_limit_messages"] == 0
+
+
 def test_gui_i18n_dict_contains_template_keys_both_languages() -> None:
     # Parse the JS _i18n object from gui.py and verify both locales have the new keys.
     from telegram_watch import gui as gui_mod
@@ -503,9 +729,20 @@ def test_gui_i18n_dict_contains_template_keys_both_languages() -> None:
         "messageFieldsSection",
         "languageSection",
         "notificationsSection",
+        "fullArchiveSection",
+        "fullArchiveEnabled",
+        "fullArchiveTopicIds",
+        "fullArchiveTopicIdsHelp",
+        "fullArchiveSourceBannerTitle",
+        "fullArchiveSourceBannerDesc",
     ]
     for key in required_keys:
         # Each key should appear at least twice (once in en, once in zh).
         key_literal = key.rstrip(":") + ":"
         occurrences = len(re.findall(r"\b" + re.escape(key_literal), block))
         assert occurrences >= 2, f"i18n key {key_literal!r} missing from zh or en ({occurrences} occurrences)"
+    assert (
+        "Required only when Full Archive is enabled and capture scope is Selected Topics"
+        in block
+    )
+    assert "仅在启用全量归档且采集范围为指定话题时必填" in block

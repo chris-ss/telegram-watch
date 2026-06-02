@@ -198,7 +198,48 @@ Field | Description | Default
 
 You may leave the defaults or point them to any writable path. The `doctor` command verifies that the directories exist (or can be created) and that the DB file is writable.
 
-## 8. Reporting (`[reporting]`)
+## 8. Optional full archive (`[full_archive]`)
+
+Full archive is an optional local context layer. It is disabled by default. When enabled, tgwatch silently records the selected source group or selected forum Topics into separate SQLite shards under `root_dir`; existing tracked-user pushes and reports continue to use the normal tracked DB.
+
+Field | Description | Default
+----- | ----------- | -------
+`enabled` | Enable the archive writer and `archive-backfill` writes. | `false`
+`root_dir` | Folder for `manifest.sqlite3` and archive shards. Safe to delete when you want to remove archive data. | `data/full_archive`
+`source_chat_id` | Group/channel ID to archive. Required when `enabled = true`; must not be `0`. Prefer one of the configured `targets[].target_chat_id` values so the archive can recover context around tracked messages; `doctor` and the GUI warn when it does not match any target. | _(empty)_
+`capture_scope` | `"whole_group"` archives the whole source group; `"topics"` archives only `topic_ids`. | `"whole_group"`
+`topic_ids` | Topic IDs to archive when `enabled = true` and `capture_scope = "topics"`. Disabled configs may keep this empty as a setup draft. Values must be Telegram forum topic IDs greater than `1`; General topic ID `1` is treated as unclassified archive context and requires `capture_scope = "whole_group"`. Use `tgwatch list-topics --config config.toml --chat <chat_id>` to discover IDs. | `[]`
+`shard_policy` | Currently only `"monthly"` is supported. | `"monthly"`
+`max_messages_per_shard` | Rotate to a numbered shard after this many messages in one month. | `500000`
+`max_shard_size_mb` | Rotate to a numbered shard after this file size. | `1024`
+`backfill_limit_messages` | Default scan limit for `archive-backfill` when `--limit` is omitted. `0` disables default backfill and makes the command a no-op unless `--limit` is provided. | `10000`
+
+Full archive does not support automatic retention in this phase. Do not set `full_archive.retention_days`; remove old archive data manually by deleting selected shard files, a group folder, or the whole `root_dir`.
+
+Deleting the whole `root_dir` resets only the optional archive layer. `archive-status` then reports an empty archive, `archive-context` stays read-only and returns no archived rows, and the next live capture or `archive-backfill --apply` recreates manifest/shard files from a new empty archive state. Deleting selected shard files or group folders is different: the old manifest remains, so use `archive-repair --prune-missing-shards --apply` after confirming the deletion was intentional.
+
+Useful commands:
+
+```bash
+python -m tgwatch list-topics --config config.toml --chat -1001234567890
+python -m tgwatch archive-status --config config.toml
+python -m tgwatch archive-qa-init --config config.toml
+python -m tgwatch archive-repair --config config.toml --dry-run
+python -m tgwatch archive-repair --config config.toml --prune-missing-shards --apply
+python -m tgwatch archive-context --config config.toml --chat -1001234567890 --message-id 12345
+python -m tgwatch archive-backfill --config config.toml --limit 100 --dry-run
+python -m tgwatch archive-backfill --config config.toml --limit 100 --apply
+```
+
+`archive-backfill` defaults to dry-run. It writes archive rows only when `--apply` is provided. A limit of `0` is a successful no-op and does not connect to Telegram.
+`list-topics` marks normal forum Topics as usable in `topic_ids` and marks General (`1`) as `whole_group`, so do not copy `1` into `full_archive.topic_ids`.
+`archive-qa-init` creates a redaction-aware real Telegram QA draft under `reports/full_archive_qa/`, which is gitignored.
+`archive-status` is read-only; when full archive is disabled it reports disabled and must not create archive files.
+`archive-repair` defaults to dry-run and repairs only archive metadata that can be rebuilt locally, such as required shard indexes and manifest shard counts, when `--apply` is provided.
+After manually deleting shard files or a group folder, run `archive-repair --prune-missing-shards --apply` to remove stale manifest rows. This only deletes manifest records for files that are already missing; it never deletes shard files, tracked DBs, or media files. If you deleted the whole `root_dir`, no repair is needed before the next write; that is treated as a fresh archive.
+`archive-context` is read-only and prints the archived timeline around a tracked message.
+
+## 9. Reporting (`[reporting]`)
 
 Field | Description | Default
 ----- | ----------- | -------
@@ -209,7 +250,7 @@ Field | Description | Default
 
 During each window, tgwatch writes the HTML report to `reports_dir`, uploads that file to the control chat, and then streams the window内的每条消息（文本 + 引用 + 媒体）到控制聊天，方便在手机端查看。Reply sections in each report include any quoted images/documents so you can see the full context without opening Telegram.
 
-## 9. Display (`[display]`)
+## 10. Display (`[display]`)
 
 Field | Description | Default
 ----- | ----------- | -------
@@ -217,7 +258,7 @@ Field | Description | Default
 `time_format` | Timestamp format for control-chat pushes (`strftime` syntax). In GUI, this field is a structured builder with dropdowns for year, month, day, hour, minute, second, date separator, and timezone display; existing non-builder formats are preserved as custom values with a raw text fallback. | `%Y.%m.%d %H:%M:%S (%Z)`
 `language` | Language for push messages: `"auto"` (detect from system locale), `"zh"`, or `"en"`. Also used by the GUI. | `"auto"`
 
-## 10. Notifications (`[notifications]`)
+## 11. Notifications (`[notifications]`)
 
 Field | Description | Default
 ----- | ----------- | -------
@@ -225,7 +266,7 @@ Field | Description | Default
 `heartbeat_interval_hours` | Hours of inactivity before sending a "still running" heartbeat. Set to `0` to disable. | `2`
 `check_updates` | Automatically check GitHub for new releases every 24 hours and notify control groups. | `true`
 
-## 11. Validate the configuration
+## 12. Validate the configuration
 
 After editing `config.toml`, run:
 

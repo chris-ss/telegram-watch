@@ -550,6 +550,22 @@ const _i18n = {
     storageReporting: "Storage & Reporting",
     dbPath: "DB Path",
     mediaDir: "Media Dir",
+    fullArchiveSection: "Full Message Archive",
+    fullArchiveHelp: "Optional local context archive. Disabled by default; when enabled it silently stores group context in separate SQLite shards.",
+    fullArchiveEnabled: "Enable Full Archive",
+    fullArchiveRoot: "Archive Root Dir",
+    fullArchiveSourceChat: "Source Chat ID",
+    fullArchiveScope: "Capture Scope",
+    fullArchiveScopeWhole: "Whole Group",
+    fullArchiveScopeTopics: "Selected Topics",
+    fullArchiveTopicIds: "Topic IDs",
+    fullArchiveTopicIdsHelp: "Comma-separated topic IDs. Required only when Full Archive is enabled and capture scope is Selected Topics.",
+    fullArchiveShardPolicy: "Shard Policy",
+    fullArchiveMaxMessages: "Max Messages / Shard",
+    fullArchiveMaxSize: "Max Shard Size (MB)",
+    fullArchiveBackfillLimit: "Backfill Limit",
+    fullArchiveSourceBannerTitle: "Full archive source is not a configured target",
+    fullArchiveSourceBannerDesc: "The archive can still run, but it may not recover context around tracked messages because this source chat is not one of the monitored target chats.",
     reportsDir: "Reports Dir",
     defaultSummaryInterval: "Default Summary Interval",
     timezone: "Timezone",
@@ -723,6 +739,22 @@ const _i18n = {
     storageReporting: "存储与报告",
     dbPath: "数据库路径",
     mediaDir: "媒体目录",
+    fullArchiveSection: "全量消息归档",
+    fullArchiveHelp: "可选的本地上下文归档。默认关闭；启用后会静默保存群组上下文到独立 SQLite 分片。",
+    fullArchiveEnabled: "启用全量归档",
+    fullArchiveRoot: "归档根目录",
+    fullArchiveSourceChat: "来源群组 ID",
+    fullArchiveScope: "采集范围",
+    fullArchiveScopeWhole: "整个群组",
+    fullArchiveScopeTopics: "指定话题",
+    fullArchiveTopicIds: "话题 ID",
+    fullArchiveTopicIdsHelp: "多个话题 ID 用逗号分隔。仅在启用全量归档且采集范围为指定话题时必填。",
+    fullArchiveShardPolicy: "分片策略",
+    fullArchiveMaxMessages: "每个分片最大消息数",
+    fullArchiveMaxSize: "每个分片最大大小（MB）",
+    fullArchiveBackfillLimit: "回填上限",
+    fullArchiveSourceBannerTitle: "全量归档来源不是当前监控目标",
+    fullArchiveSourceBannerDesc: "归档仍可运行，但这个来源群组不是当前 targets 中的监控群组，可能无法恢复 tracked 消息上下文。",
     reportsDir: "报告目录",
     defaultSummaryInterval: "默认汇总间隔",
     timezone: "时区",
@@ -1542,6 +1574,12 @@ function render() {
         <p>${t("cloudSyncBannerDesc")}</p>
       </div>`
     : "";
+  const fullArchiveSourceBanner = data.full_archive_source_warning
+    ? `<div class="warning-banner">
+        \\u26A0\\uFE0F ${t("fullArchiveSourceBannerTitle")}
+        <p>${t("fullArchiveSourceBannerDesc")}</p>
+      </div>`
+    : "";
 
   app.innerHTML = `
     <div class="header">
@@ -1558,6 +1596,7 @@ function render() {
       </div>
     </div>
     ${cloudSyncBanner}
+    ${fullArchiveSourceBanner}
     ${statusBlock}
     ${errorBlock}
     ${lockBanner}
@@ -1810,6 +1849,56 @@ function render() {
         <div class="field">
           <label>${t("retentionDays")}</label>
           <input data-field="reporting.retention_days" value="${data.reporting.retention_days}" />
+        </div>
+      </div>
+
+      <h3 style="margin-top:24px;margin-bottom:8px;font-size:15px;font-weight:600;">${t("fullArchiveSection")}</h3>
+      <p style="margin-top:0;margin-bottom:10px;font-size:13px;color:var(--muted,#666);">${t("fullArchiveHelp")}</p>
+      <div class="grid">
+        <div class="field">
+          <label>${t("fullArchiveEnabled")}</label>
+          <select data-field="full_archive.enabled">
+            <option value="false" ${data.full_archive.enabled ? "" : "selected"}>false</option>
+            <option value="true" ${data.full_archive.enabled ? "selected" : ""}>true</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>${t("fullArchiveRoot")}</label>
+          <input data-field="full_archive.root_dir" value="${data.full_archive.root_dir}" />
+        </div>
+        <div class="field">
+          <label>${t("fullArchiveSourceChat")}</label>
+          <input data-field="full_archive.source_chat_id" value="${data.full_archive.source_chat_id || ""}" />
+        </div>
+        <div class="field">
+          <label>${t("fullArchiveScope")}</label>
+          <select data-field="full_archive.capture_scope">
+            <option value="whole_group" ${data.full_archive.capture_scope !== "topics" ? "selected" : ""}>${t("fullArchiveScopeWhole")}</option>
+            <option value="topics" ${data.full_archive.capture_scope === "topics" ? "selected" : ""}>${t("fullArchiveScopeTopics")}</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>${t("fullArchiveTopicIds")}</label>
+          <input data-field="full_archive.topic_ids" value="${data.full_archive.topic_ids}" />
+          <small>${t("fullArchiveTopicIdsHelp")}</small>
+        </div>
+        <div class="field">
+          <label>${t("fullArchiveShardPolicy")}</label>
+          <select data-field="full_archive.shard_policy">
+            <option value="monthly" ${data.full_archive.shard_policy === "monthly" ? "selected" : ""}>monthly</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>${t("fullArchiveMaxMessages")}</label>
+          <input data-field="full_archive.max_messages_per_shard" value="${data.full_archive.max_messages_per_shard}" />
+        </div>
+        <div class="field">
+          <label>${t("fullArchiveMaxSize")}</label>
+          <input data-field="full_archive.max_shard_size_mb" value="${data.full_archive.max_shard_size_mb}" />
+        </div>
+        <div class="field">
+          <label>${t("fullArchiveBackfillLimit")}</label>
+          <input data-field="full_archive.backfill_limit_messages" value="${data.full_archive.backfill_limit_messages}" />
         </div>
       </div>
     </section>
@@ -2924,6 +3013,7 @@ def _normalize_config(raw: dict[str, Any]) -> dict[str, Any]:
     display = raw.get("display", {})
     notifications = raw.get("notifications", {})
     realtime = raw.get("realtime", {})
+    full_archive = raw.get("full_archive", {})
 
     api_hash = telegram.get("api_hash")
     data = {
@@ -2945,6 +3035,17 @@ def _normalize_config(raw: dict[str, Any]) -> dict[str, Any]:
         "storage": {
             "db_path": storage.get("db_path", "data/tgwatch.sqlite3"),
             "media_dir": storage.get("media_dir", "data/media"),
+        },
+        "full_archive": {
+            "enabled": bool(full_archive.get("enabled", False)),
+            "root_dir": full_archive.get("root_dir", "data/full_archive"),
+            "source_chat_id": full_archive.get("source_chat_id", ""),
+            "capture_scope": str(full_archive.get("capture_scope", "whole_group")).strip().lower(),
+            "topic_ids": _format_topic_ids_for_gui(full_archive.get("topic_ids", [])),
+            "shard_policy": str(full_archive.get("shard_policy", "monthly")).strip().lower(),
+            "max_messages_per_shard": full_archive.get("max_messages_per_shard", 500000),
+            "max_shard_size_mb": full_archive.get("max_shard_size_mb", 1024),
+            "backfill_limit_messages": full_archive.get("backfill_limit_messages", 10000),
         },
         "reporting": {
             "reports_dir": reporting.get("reports_dir", "reports"),
@@ -3006,6 +3107,7 @@ def _normalize_config(raw: dict[str, Any]) -> dict[str, Any]:
     if not targets:
         targets = [blank_target()]
     data["targets"] = targets
+    data["full_archive_source_warning"] = _full_archive_source_warning(data)
 
     control_groups_raw: dict[str, Any] = {}
     if "control_groups" in raw:
@@ -3049,6 +3151,21 @@ def _normalize_config(raw: dict[str, Any]) -> dict[str, Any]:
         control_groups = [blank_control_group()]
     data["control_groups"] = control_groups
     return data
+
+
+def _full_archive_source_warning(data: dict[str, Any]) -> bool:
+    full_archive = data.get("full_archive", {})
+    if not _parse_gui_bool(full_archive.get("enabled", False)):
+        return False
+    source_chat_id = _try_int(full_archive.get("source_chat_id", ""))
+    if source_chat_id is None:
+        return False
+    target_ids = {
+        target_id
+        for target in data.get("targets", [])
+        if (target_id := _try_int(target.get("target_chat_id", ""))) is not None
+    }
+    return source_chat_id not in target_ids
 
 
 def blank_target() -> dict[str, Any]:
@@ -3272,6 +3389,7 @@ def _validate_payload(payload: dict[str, Any], raw_existing: dict[str, Any]) -> 
 
     reporting = payload.get("reporting", {}) or {}
     storage = payload.get("storage", {}) or {}
+    full_archive = payload.get("full_archive", {}) or {}
     display = payload.get("display", {}) or {}
     notifications = payload.get("notifications", {}) or {}
     realtime_raw = payload.get("realtime", {}) or {}
@@ -3317,6 +3435,53 @@ def _validate_payload(payload: dict[str, Any], raw_existing: dict[str, Any]) -> 
     if rt_warmup_min is None or rt_warmup_min <= 0:
         rt_warmup_min = 5.0
 
+    full_archive_enabled = _parse_gui_bool(full_archive.get("enabled", False))
+    full_archive_scope = str(full_archive.get("capture_scope", "whole_group")).strip().lower()
+    if full_archive_scope not in ("whole_group", "topics"):
+        errors.append("full_archive.capture_scope must be 'whole_group' or 'topics'")
+        full_archive_scope = "whole_group"
+    full_archive_shard_policy = str(full_archive.get("shard_policy", "monthly")).strip().lower()
+    if full_archive_shard_policy != "monthly":
+        errors.append("full_archive.shard_policy currently supports only 'monthly'")
+        full_archive_shard_policy = "monthly"
+    full_archive_source_chat_id = _try_int(full_archive.get("source_chat_id", ""))
+    full_archive_topic_ids = _parse_topic_ids_for_gui(
+        full_archive.get("topic_ids", ""),
+        errors,
+    )
+    if full_archive_enabled and full_archive_source_chat_id is None:
+        errors.append("full_archive.source_chat_id is required when enabled")
+    if full_archive_enabled and full_archive_source_chat_id == 0:
+        errors.append("full_archive.source_chat_id must not be 0")
+    if full_archive_enabled and full_archive_scope == "topics" and not full_archive_topic_ids:
+        errors.append("full_archive.topic_ids is required when capture_scope is 'topics'")
+    full_archive_max_messages = _coerce_int(
+        full_archive.get("max_messages_per_shard", 500000),
+        "full_archive.max_messages_per_shard",
+        errors,
+    ) or 500000
+    if full_archive_max_messages <= 0:
+        errors.append("full_archive.max_messages_per_shard must be > 0")
+        full_archive_max_messages = 500000
+    full_archive_max_size = _coerce_int(
+        full_archive.get("max_shard_size_mb", 1024),
+        "full_archive.max_shard_size_mb",
+        errors,
+    ) or 1024
+    if full_archive_max_size <= 0:
+        errors.append("full_archive.max_shard_size_mb must be > 0")
+        full_archive_max_size = 1024
+    full_archive_backfill_limit = _coerce_int(
+        full_archive.get("backfill_limit_messages", 10000),
+        "full_archive.backfill_limit_messages",
+        errors,
+    )
+    if full_archive_backfill_limit is None:
+        full_archive_backfill_limit = 10000
+    if full_archive_backfill_limit < 0:
+        errors.append("full_archive.backfill_limit_messages must be >= 0")
+        full_archive_backfill_limit = 10000
+
     normalized = {
         "config_version": 1.0,
         "telegram": {
@@ -3333,6 +3498,18 @@ def _validate_payload(payload: dict[str, Any], raw_existing: dict[str, Any]) -> 
         "storage": {
             "db_path": str(storage.get("db_path", "data/tgwatch.sqlite3")).strip(),
             "media_dir": str(storage.get("media_dir", "data/media")).strip(),
+        },
+        "full_archive": {
+            "enabled": full_archive_enabled,
+            "root_dir": str(full_archive.get("root_dir", "data/full_archive")).strip()
+            or "data/full_archive",
+            "source_chat_id": full_archive_source_chat_id,
+            "capture_scope": full_archive_scope,
+            "topic_ids": full_archive_topic_ids,
+            "shard_policy": full_archive_shard_policy,
+            "max_messages_per_shard": full_archive_max_messages,
+            "max_shard_size_mb": full_archive_max_size,
+            "backfill_limit_messages": full_archive_backfill_limit,
         },
         "reporting": {
             "reports_dir": str(reporting.get("reports_dir", "reports")).strip(),
@@ -3406,6 +3583,14 @@ def _coerce_int(value: Any, label: str, errors: list[str]) -> int | None:
         return None
 
 
+def _parse_gui_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
 def _try_int(value: Any) -> int | None:
     if value is None:
         return None
@@ -3430,6 +3615,43 @@ def _try_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _format_topic_ids_for_gui(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        return ", ".join(str(item) for item in value)
+    return ""
+
+
+def _parse_topic_ids_for_gui(value: Any, errors: list[str]) -> list[int]:
+    if value in (None, ""):
+        return []
+    if isinstance(value, str):
+        raw_items = [item.strip() for item in value.split(",")]
+    elif isinstance(value, (list, tuple)):
+        raw_items = list(value)
+    else:
+        errors.append("full_archive.topic_ids must be a comma-separated list of integers")
+        return []
+    topic_ids: list[int] = []
+    for item in raw_items:
+        if item in ("", None):
+            continue
+        try:
+            parsed = int(item)
+        except (TypeError, ValueError):
+            errors.append("full_archive.topic_ids must be a comma-separated list of integers")
+            return []
+        if parsed <= 1:
+            errors.append(
+                "full_archive.topic_ids values must be Telegram forum topic IDs > 1; "
+                "use whole_group for General"
+            )
+            return []
+        topic_ids.append(parsed)
+    return topic_ids
 
 
 def _render_toml(config: dict[str, Any], raw_existing: dict[str, Any]) -> str:
@@ -3510,10 +3732,29 @@ def _render_toml(config: dict[str, Any], raw_existing: dict[str, Any]) -> str:
                     lines.append(f"{entry['user_id']} = {entry['topic_id']}")
 
     storage = config["storage"]
+    full_archive = config.get("full_archive", {})
     reporting = config["reporting"]
     display = config["display"]
     notifications = config["notifications"]
     realtime = config.get("realtime", {})
+
+    full_archive_lines = [
+        "[full_archive]",
+        f"enabled = {toml_bool(_parse_gui_bool(full_archive.get('enabled', False)))}",
+        f"root_dir = {toml_string(str(full_archive.get('root_dir', 'data/full_archive')))}",
+    ]
+    if full_archive.get("source_chat_id") not in (None, ""):
+        full_archive_lines.append(f"source_chat_id = {full_archive.get('source_chat_id')}")
+    full_archive_lines.extend(
+        [
+            f"capture_scope = {toml_string(str(full_archive.get('capture_scope', 'whole_group')))}",
+            f"topic_ids = {toml_list(full_archive.get('topic_ids', []))}",
+            f"shard_policy = {toml_string(str(full_archive.get('shard_policy', 'monthly')))}",
+            f"max_messages_per_shard = {full_archive.get('max_messages_per_shard', 500000)}",
+            f"max_shard_size_mb = {full_archive.get('max_shard_size_mb', 1024)}",
+            f"backfill_limit_messages = {full_archive.get('backfill_limit_messages', 10000)}",
+        ]
+    )
 
     lines.extend(
         [
@@ -3521,6 +3762,8 @@ def _render_toml(config: dict[str, Any], raw_existing: dict[str, Any]) -> str:
             "[storage]",
             f"db_path = {toml_string(storage['db_path'])}",
             f"media_dir = {toml_string(storage['media_dir'])}",
+            "",
+            *full_archive_lines,
             "",
             "[reporting]",
             f"reports_dir = {toml_string(reporting['reports_dir'])}",

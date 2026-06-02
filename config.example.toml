@@ -82,6 +82,20 @@ warmup_rate    = 5
 db_path = "data/tgwatch.sqlite3"
 media_dir = "data/media"
 
+[full_archive]
+# Optional local context archive. Disabled by default and independent of the
+# tracked-user database above.
+enabled = false
+root_dir = "data/full_archive"
+# Required when enabled = true. Prefer one of the target_chat_id values above.
+# source_chat_id = -1001234567890
+capture_scope = "whole_group"  # "whole_group" | "topics"
+topic_ids = []                  # required only when enabled = true and capture_scope = "topics"; IDs must be > 1 (General uses whole_group)
+shard_policy = "monthly"
+max_messages_per_shard = 500000
+max_shard_size_mb = 1024
+backfill_limit_messages = 10000
+
 [reporting]
 reports_dir = "reports"
 summary_interval_minutes = 120
