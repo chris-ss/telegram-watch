@@ -2862,6 +2862,95 @@ async def test_list_topics_fetches_forum_topics(monkeypatch, tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_list_topics_prefers_channels_api(monkeypatch, tmp_path: Path):
+    config = build_config(tmp_path)
+    requests = []
+
+    class ChannelForumTopicsRequest:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class DummyClient:
+        async def get_input_entity(self, chat):
+            assert chat == -100123
+            return "input-channel"
+
+        async def __call__(self, request):
+            requests.append(request)
+            return SimpleNamespace(topics=[])
+
+        async def disconnect(self):
+            return None
+
+    async def fake_start_client(_client, _role):
+        return None
+
+    monkeypatch.setattr(runner, "_build_client", lambda _config: DummyClient())
+    monkeypatch.setattr(runner, "_start_client", fake_start_client)
+    monkeypatch.setattr(
+        runner.functions,
+        "channels",
+        SimpleNamespace(GetForumTopicsRequest=ChannelForumTopicsRequest),
+    )
+
+    await runner.run_list_topics(config, chat=-100123, limit=25, query="FLT")
+
+    assert len(requests) == 1
+    assert requests[0].channel == "input-channel"
+    assert requests[0].limit == 25
+    assert requests[0].q == "FLT"
+
+
+@pytest.mark.asyncio
+async def test_list_topics_falls_back_to_messages_api(monkeypatch, tmp_path: Path):
+    config = build_config(tmp_path)
+    requests = []
+
+    class BrokenChannelForumTopicsRequest:
+        def __init__(self, **_kwargs):
+            raise TypeError("unexpected keyword argument channel")
+
+    class MessageForumTopicsRequest:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class DummyClient:
+        async def get_input_entity(self, chat):
+            assert chat == -100123
+            return "input-peer"
+
+        async def __call__(self, request):
+            requests.append(request)
+            return SimpleNamespace(topics=[])
+
+        async def disconnect(self):
+            return None
+
+    async def fake_start_client(_client, _role):
+        return None
+
+    monkeypatch.setattr(runner, "_build_client", lambda _config: DummyClient())
+    monkeypatch.setattr(runner, "_start_client", fake_start_client)
+    monkeypatch.setattr(
+        runner.functions,
+        "channels",
+        SimpleNamespace(GetForumTopicsRequest=BrokenChannelForumTopicsRequest),
+    )
+    monkeypatch.setattr(
+        runner.functions,
+        "messages",
+        SimpleNamespace(GetForumTopicsRequest=MessageForumTopicsRequest),
+    )
+
+    await runner.run_list_topics(config, chat=-100123, limit=25, query="FLT")
+
+    assert len(requests) == 1
+    assert requests[0].peer == "input-peer"
+    assert requests[0].limit == 25
+    assert requests[0].q == "FLT"
+
+
+@pytest.mark.asyncio
 async def test_list_topics_rejects_invalid_limit(tmp_path: Path):
     with pytest.raises(ValueError):
         await runner.run_list_topics(build_config(tmp_path), chat=-100123, limit=0)

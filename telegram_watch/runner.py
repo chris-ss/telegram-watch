@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
-from typing import Awaitable, Callable, Sequence, TypeVar
+from typing import Any, Awaitable, Callable, Sequence, TypeVar
 
 from telethon import TelegramClient, events, errors, functions
 from telethon.sessions import SQLiteSession
@@ -102,6 +102,41 @@ class ForumTopicInfo:
     closed: bool
     hidden: bool
     pinned: bool
+
+
+def _build_get_forum_topics_request(
+    peer: object,
+    *,
+    limit: int,
+    query: str | None,
+) -> Any:
+    channels_api = getattr(functions, "channels", None)
+    channels_request = getattr(channels_api, "GetForumTopicsRequest", None)
+    if channels_request is not None:
+        try:
+            return channels_request(
+                channel=peer,
+                offset_date=None,
+                offset_id=0,
+                offset_topic=0,
+                limit=limit,
+                q=query,
+            )
+        except TypeError:
+            # Telethon has exposed this raw API under both channels.* and
+            # messages.* across versions. Fall through to the older signature.
+            pass
+
+    messages_api = getattr(functions, "messages", None)
+    messages_request = getattr(messages_api, "GetForumTopicsRequest")
+    return messages_request(
+        peer=peer,
+        offset_date=None,
+        offset_id=0,
+        offset_topic=0,
+        limit=limit,
+        q=query,
+    )
 
 
 def _role_label(role: str) -> str:
@@ -423,13 +458,10 @@ async def run_list_topics(
     try:
         try:
             peer = await _with_floodwait(client.get_input_entity, chat)
-            request = functions.messages.GetForumTopicsRequest(
-                peer=peer,
-                offset_date=None,
-                offset_id=0,
-                offset_topic=0,
+            request = _build_get_forum_topics_request(
+                peer,
                 limit=limit,
-                q=query,
+                query=query,
             )
             result = await _with_floodwait(client.__call__, request)
         except (errors.RPCError, ValueError, TypeError, AttributeError) as exc:

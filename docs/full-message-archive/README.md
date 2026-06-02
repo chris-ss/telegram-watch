@@ -65,7 +65,7 @@
 
 ## 调研结论
 
-- Telegram forum topic 是 MTProto 里的正式能力。消息头里有 `reply_to_top_id` 等 thread/topic 字段。当前项目依赖的 Telethon 1.43 暴露为 `functions.messages.GetForumTopicsRequest`，可用于列出 forum topics。
+- Telegram forum topic 是 MTProto 里的正式能力。消息头里有 `reply_to_top_id` 等 thread/topic 字段。Telethon raw API 在不同版本里可能暴露为 `functions.channels.GetForumTopicsRequest` 或 `functions.messages.GetForumTopicsRequest`，`list-topics` 需要兼容两种位置。
 - Telethon 支持 raw MTProto request，因此即使高层 API 不完善，也应该可以通过 Telethon 调用 topic 列表接口。
 - SQLite 理论上可以存远超几十万、几百万条消息。这里建议分片，不是因为 SQLite 扛不住，而是为了删除、备份、恢复、人工检查和 GUI 查询更可控。
 - 本机 Python SQLite 构建显示 SQLite `3.51.0`，`MAX_PAGE_COUNT=1073741823`。这个上限远高于本项目预期，不是硬性瓶颈。
@@ -139,7 +139,7 @@ data/
 
 Topic 发现应该作为辅助能力，而不是第一版的强依赖：
 
-- 优先尝试通过 Telethon `functions.messages.GetForumTopicsRequest` 列出 Topic。
+- 优先尝试通过 Telethon `functions.channels.GetForumTopicsRequest` 列出 Topic；如果当前安装版本只暴露 `functions.messages.GetForumTopicsRequest`，则自动回退。
 - 如果因为权限、API 差异或限流失败，则允许用户手动填 Topic ID。
 - 如果手动填 Topic 成本太高，可以先用整群归档。
 
@@ -192,7 +192,7 @@ CR 只能按已经被证据证明的最高层级下结论：没有真实 Telegra
 
 - Telegram Threads API: https://core.telegram.org/api/threads
 - Telegram `messageReplyHeader`: https://core.telegram.org/constructor/messageReplyHeader
-- Telethon `messages.GetForumTopicsRequest`：以当前安装的 Telethon 版本为准。
+- Telethon `channels.GetForumTopicsRequest` / `messages.GetForumTopicsRequest`：以当前安装的 Telethon 版本为准。
 - Telethon client API: https://docs.telethon.dev/en/stable/modules/client.html
 - SQLite limits: https://www.sqlite.org/limits.html
 - SQLite ATTACH DATABASE: https://www.sqlite.org/lang_attach.html

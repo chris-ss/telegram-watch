@@ -187,7 +187,7 @@ Topic ID    Top Message  Archive Use    Flags        Title
 
 实现：
 
-- 使用 Telethon raw function wrapper 调 `functions.messages.GetForumTopicsRequest`；
+- 使用 Telethon raw function wrapper 调 forum topics request：优先 `functions.channels.GetForumTopicsRequest(channel=...)`，当前安装版本若只暴露 `functions.messages.GetForumTopicsRequest(peer=...)` 则回退；
 - 输出必须区分普通 Topic 和 General：`topic_id > 1` 的行显示可用于 `full_archive.topic_ids`，`topic_id = 1` 显示应使用 `capture_scope = "whole_group"`，不能误导用户把 `1` 写入 `topic_ids`；
 - 权限、entity 解析失败、API 缺失或签名差异要优雅失败，统一给出 fallback 说明，不能把 Python traceback 当成用户界面；
 - 打印手动填写 Topic ID 或改用整群归档的 fallback 说明。
