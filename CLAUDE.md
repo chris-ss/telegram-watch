@@ -15,13 +15,15 @@
   ```
 - Configure: `cp config.example.toml config.toml` and fill in api_id/api_hash, target_chat_id, tracked_user_ids, control_chat_id.
 - CLI entry point: `tgwatch` (or `python -m tgwatch`)
-- Commands: `doctor`, `gui`, `once`, `run`
+- Core commands: `doctor`, `gui`, `once`, `run`
+- Full archive commands: `archive-backfill`, `archive-status`, `archive-repair`, `archive-context`, `list-topics`, `archive-qa-init`
 - GUI launcher: `python -m tgwatch gui --config config.toml`
 
 ## Testing / quality gates
 
 - Validation: `python -m tgwatch doctor --config config.toml`
 - One-shot: `python -m tgwatch once --config config.toml --since 10m`
+- Full archive health: `python -m tgwatch archive-status --config config.toml`
 - Unit tests: `pytest tests/`
 
 ## Safety / compliance (never violate)
@@ -54,7 +56,7 @@
 | **Backlog** | 待规划/排期 |
 | **In Progress** | 正在开发中 |
 | **Code Complete** | 代码完成，等待人工验证 |
-| **QA** | 人工验证：`pytest tests/` + `doctor` + 必要时本地实跑 `once` / `run` |
+| **QA** | 人工验证：`pytest tests/` + `doctor` + full archive 相关任务的 `archive-status` + 必要时本地实跑 `once` / `run` |
 | **Release** | 确认通过，可发布或已发布 |
 
 ### 标签与项目边界
@@ -94,7 +96,7 @@ comment 正文：
 4. 任务移到 **Code Complete**；comment 说明等待人工验证（如有 PR 附链接）。
 
 **人工验证（QA）通过后：**
-5. 本地跑通：`pytest tests/` + `python -m tgwatch doctor --config config.toml`（必要时 `once --since 10m`）。
+5. 本地跑通：`pytest tests/` + `python -m tgwatch doctor --config config.toml`；full archive 相关任务还要跑 `python -m tgwatch archive-status --config config.toml`（必要时 `once --since 10m`）。
 6. 任务移到 **Release**；添加最终 comment（验证结论 + 版本号）。
 7. **由用户确认后**才勾选完成，Claude/Codex **不**自行勾选。
 

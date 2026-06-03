@@ -193,7 +193,48 @@ L7 | **启动预热** — 启动后前几分钟限制发送速率，防止积压
 
 可保留默认值或设置为可写路径。`doctor` 会检查目录可创建且数据库可写。
 
-## 8. 报告（`[reporting]`）
+## 8. 可选全量归档（`[full_archive]`）
+
+全量归档是可选的本地上下文层，默认关闭。开启后，tgwatch 会把指定源群组或指定 forum Topic 静默写入 `root_dir` 下独立的 SQLite manifest 和分片；现有 tracked-user 推送与报告仍继续使用原 tracked DB。
+
+字段 | 描述 | 默认值
+----- | ---- | ------
+`enabled` | 启用归档写入和 `archive-backfill --apply` 写入。 | `false`
+`root_dir` | 保存 `manifest.sqlite3` 与归档分片的目录。想删除归档数据时可以单独删除。 | `data/full_archive`
+`source_chat_id` | 要归档的群组/频道 ID。`enabled = true` 时必填，且不能是 `0`。建议填写某个 `targets[].target_chat_id`，这样归档才能恢复 tracked 消息上下文；不匹配时 `doctor` 和 GUI 会给 warning。 | （空）
+`capture_scope` | `"whole_group"` 归档整个源群组；`"topics"` 只归档 `topic_ids`。 | `"whole_group"`
+`topic_ids` | `enabled = true` 且 `capture_scope = "topics"` 时要归档的 Topic ID。关闭状态可以先留空作为配置草稿。值必须大于 `1`；General Topic `1` 需要用 `capture_scope = "whole_group"` 覆盖。可用 `tgwatch list-topics --config config.toml --chat <chat_id>` 查询。 | `[]`
+`shard_policy` | 当前只支持 `"monthly"`。 | `"monthly"`
+`max_messages_per_shard` | 单个月度分片达到该消息数后切到序号分片。 | `500000`
+`max_shard_size_mb` | 单个分片达到该大小后切到序号分片。 | `1024`
+`backfill_limit_messages` | 省略 `--limit` 时 `archive-backfill` 的默认扫描上限。`0` 表示默认回填 no-op，除非命令显式传入 `--limit`。 | `10000`
+
+本阶段不支持自动归档保留策略。不要配置 `full_archive.retention_days`；如需清理，手动删除某些 shard、某个 group 目录或整个 `root_dir`。
+
+删除整个 `root_dir` 只会重置可选归档层。之后 `archive-status` 显示 empty，`archive-context` 保持只读并返回无归档行；下一次 live capture 或 `archive-backfill --apply` 会从新的空归档状态重新创建 manifest/shard。只删除部分 shard 或 group 目录时，旧 manifest 仍在；确认是手动清理后，可运行 `archive-repair --prune-missing-shards --apply` 清理缺失文件对应的 manifest 行。
+
+常用命令：
+
+```bash
+python -m tgwatch list-topics --config config.toml --chat -1001234567890
+python -m tgwatch archive-status --config config.toml
+python -m tgwatch archive-qa-init --config config.toml
+python -m tgwatch archive-repair --config config.toml --dry-run
+python -m tgwatch archive-repair --config config.toml --prune-missing-shards --apply
+python -m tgwatch archive-context --config config.toml --chat -1001234567890 --message-id 12345
+python -m tgwatch archive-backfill --config config.toml --limit 100 --dry-run
+python -m tgwatch archive-backfill --config config.toml --limit 100 --apply
+```
+
+`archive-backfill` 默认 dry-run，只有传 `--apply` 才写入归档。`--limit 0` 是成功 no-op，不连接 Telegram。
+`list-topics` 会把普通 Topic 标为可用于 `topic_ids`，把 General (`1`) 标为 `whole_group`，不要把 `1` 填进 `full_archive.topic_ids`。
+`archive-qa-init` 会在 `reports/full_archive_qa/` 下创建带脱敏提示的真实 Telegram QA 草稿；`reports/` 已在 `.gitignore` 中排除。
+`archive-status` 是只读命令；full archive 关闭时只显示 disabled，不能创建归档文件。
+`archive-repair` 默认 dry-run；只有传 `--apply` 时，才修复可由本地事实重建的归档元数据，例如必需 shard 索引和 manifest shard 计数。
+手动删除 shard 文件或 group 目录后，运行 `archive-repair --prune-missing-shards --apply` 清理失效 manifest 行。这个命令只删除已经缺失文件对应的 manifest 记录，不会删除 shard 文件、tracked DB 或媒体文件。如果删除的是整个 `root_dir`，下一次写入会按新归档处理，写入前不需要 repair。
+`archive-context` 是只读命令，用于输出某条 tracked message 前后的归档时间线。
+
+## 9. 报告（`[reporting]`）
 
 字段 | 描述 | 默认值
 ----- | ---- | ------
@@ -204,7 +245,7 @@ L7 | **启动预热** — 启动后前几分钟限制发送速率，防止积压
 
 每个时间窗内，tgwatch 会生成 HTML 报告并推送到控制群，然后逐条发送该窗口的消息（含引用与媒体）。
 
-## 9. 显示（`[display]`）
+## 10. 显示（`[display]`）
 
 字段 | 描述 | 默认值
 ----- | ---- | ------
@@ -212,7 +253,7 @@ L7 | **启动预热** — 启动后前几分钟限制发送速率，防止积压
 `time_format` | 时间戳格式（strftime 语法）。GUI 中该字段提供结构化构建器，包含年、月、日、时、分、秒、日期分隔符和时区显示的下拉菜单；若配置里已有非构建器格式值，会以自定义值保留并可用原始文本编辑。 | `%Y.%m.%d %H:%M:%S (%Z)`
 `language` | 推送消息语言：`"auto"`（根据系统区域设置自动检测）、`"zh"` 或 `"en"`。GUI 也使用此设置。 | `"auto"`
 
-## 10. 通知（`[notifications]`）
+## 11. 通知（`[notifications]`）
 
 字段 | 描述 | 默认值
 ----- | ---- | ------
@@ -220,7 +261,7 @@ L7 | **启动预热** — 启动后前几分钟限制发送速率，防止积压
 `heartbeat_interval_hours` | 无活动多少小时后发送"仍在运行"心跳。设为 `0` 关闭。 | `2`
 `check_updates` | 每 24 小时自动检查 GitHub 新版本并通知控制群。 | `true`
 
-## 11. 验证配置
+## 12. 验证配置
 
 编辑 `config.toml` 后执行：
 

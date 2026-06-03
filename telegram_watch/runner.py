@@ -13,9 +13,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
-from typing import Awaitable, Callable, Sequence, TypeVar
+from typing import Any, Awaitable, Callable, Sequence, TypeVar
 
-from telethon import TelegramClient, events, errors
+from telethon import TelegramClient, events, errors, functions
 from telethon.sessions import SQLiteSession
 from telethon.tl.custom import message as custom_message
 
@@ -24,6 +24,19 @@ from .config import (
     ControlGroupConfig,
     DEFAULT_TIME_FORMAT,
     TargetGroupConfig,
+)
+from .full_archive_storage import (
+    ArchiveMedia,
+    ArchiveMessage,
+    archive_message_exists,
+    connect as archive_connect,
+    find_shard_for_message,
+    inspect_archive_status,
+    persist_archive_message,
+    persist_archive_message_with_result,
+    record_tracked_db_link,
+    record_shard_write,
+    select_shard,
 )
 from .links import build_message_link
 from .notifications import send_bark_notification
@@ -45,6 +58,10 @@ from .timeutils import parse_since_spec, utc_now
 
 logger = logging.getLogger(__name__)
 
+ARCHIVE_BACKFILL_WAIT_THRESHOLD = 1_000
+ARCHIVE_BACKFILL_WAIT_TIME_SECONDS = 1.0
+ARCHIVE_RELINK_SHUTDOWN_TIMEOUT_SECONDS = 5.0
+
 
 @dataclass
 class ReplyCleanupStats:
@@ -56,6 +73,71 @@ class ReplyCleanupStats:
     cleared_messages: int = 0
     cleared_media: int = 0
     backup_path: Path | None = None
+
+
+@dataclass
+class ArchiveBackfillStats:
+    scanned: int = 0
+    matched: int = 0
+    skipped_scope: int = 0
+    skipped_invalid: int = 0
+    archived: int = 0
+    linked: int = 0
+    updated: int = 0
+    dry_run: bool = True
+
+
+@dataclass(frozen=True)
+class ArchivePersistResult:
+    payload_mode: str
+    created: bool
+    linked: bool
+
+
+@dataclass(frozen=True)
+class ForumTopicInfo:
+    topic_id: int
+    title: str
+    top_message: int | None
+    unread_count: int
+    closed: bool
+    hidden: bool
+    pinned: bool
+
+
+def _build_get_forum_topics_request(
+    peer: object,
+    *,
+    limit: int,
+    query: str | None,
+) -> Any:
+    channels_api = getattr(functions, "channels", None)
+    channels_request = getattr(channels_api, "GetForumTopicsRequest", None)
+    if channels_request is not None:
+        try:
+            return channels_request(
+                channel=peer,
+                offset_date=None,
+                offset_id=0,
+                offset_topic=0,
+                limit=limit,
+                q=query,
+            )
+        except TypeError:
+            # Telethon has exposed this raw API under both channels.* and
+            # messages.* across versions. Fall through to the older signature.
+            pass
+
+    messages_api = getattr(functions, "messages", None)
+    messages_request = getattr(messages_api, "GetForumTopicsRequest")
+    return messages_request(
+        peer=peer,
+        offset_date=None,
+        offset_id=0,
+        offset_topic=0,
+        limit=limit,
+        q=query,
+    )
 
 
 def _role_label(role: str) -> str:
@@ -275,6 +357,142 @@ async def run_reply_cleanup(
     return stats
 
 
+async def run_archive_backfill(
+    config: Config,
+    *,
+    limit: int | None = None,
+    apply: bool = False,
+) -> ArchiveBackfillStats:
+    archive = config.full_archive
+    if not archive.enabled or archive.source_chat_id is None:
+        raise ValueError("full_archive must be enabled before running archive-backfill")
+    effective_limit = limit if limit is not None else archive.backfill_limit_messages
+    if effective_limit < 0:
+        raise ValueError("archive-backfill limit must be >= 0")
+
+    stats = ArchiveBackfillStats(dry_run=not apply)
+    if effective_limit == 0:
+        return stats
+
+    client = _build_client(config)
+    await _start_client(client, "primary")
+    try:
+        remaining = effective_limit
+        offset_id = 0
+        wait_time = (
+            ARCHIVE_BACKFILL_WAIT_TIME_SECONDS
+            if effective_limit > ARCHIVE_BACKFILL_WAIT_THRESHOLD
+            else None
+        )
+        while remaining > 0:
+            try:
+                async for msg in client.iter_messages(
+                    archive.source_chat_id,
+                    limit=remaining,
+                    offset_id=offset_id,
+                    wait_time=wait_time,
+                ):
+                    msg_id = _coerce_optional_int(getattr(msg, "id", None))
+                    if msg_id is not None:
+                        offset_id = msg_id
+                    remaining -= 1
+                    stats.scanned += 1
+                    archive_message = _archive_message_from_telegram(
+                        msg,
+                        chat_id_default=archive.source_chat_id,
+                    )
+                    if archive_message is None:
+                        stats.skipped_invalid += 1
+                        if remaining <= 0:
+                            break
+                        continue
+                    if not _archive_message_matches_scope(config, archive_message):
+                        stats.skipped_scope += 1
+                        if remaining <= 0:
+                            break
+                        continue
+                    stats.matched += 1
+                    if not apply:
+                        if remaining <= 0:
+                            break
+                        continue
+                    persist_result = _persist_archive_message_to_storage(
+                        config,
+                        archive_message,
+                        tracked_db_path=config.storage.db_path,
+                    )
+                    if persist_result.linked:
+                        stats.linked += 1
+                    elif not persist_result.created:
+                        stats.updated += 1
+                    else:
+                        stats.archived += 1
+                    if remaining <= 0:
+                        break
+                break
+            except errors.FloodWaitError as exc:
+                if remaining <= 0:
+                    break
+                wait_time = ARCHIVE_BACKFILL_WAIT_TIME_SECONDS
+                wait_for = exc.seconds + 1
+                logger.warning(
+                    "FloodWait during archive backfill: sleeping for %ss",
+                    wait_for,
+                )
+                await asyncio.sleep(wait_for)
+    finally:
+        await client.disconnect()
+    return stats
+
+
+async def run_list_topics(
+    config: Config,
+    *,
+    chat: int | str,
+    limit: int = 100,
+    query: str | None = None,
+) -> list[ForumTopicInfo]:
+    if limit <= 0:
+        raise ValueError("list-topics limit must be > 0")
+    client = _build_client(config)
+    await _start_client(client, "primary")
+    try:
+        try:
+            peer = await _with_floodwait(client.get_input_entity, chat)
+            request = _build_get_forum_topics_request(
+                peer,
+                limit=limit,
+                query=query,
+            )
+            result = await _with_floodwait(client.__call__, request)
+        except (errors.RPCError, ValueError, TypeError, AttributeError) as exc:
+            raise ValueError(f"Cannot list topics for {chat}: {exc}") from exc
+    finally:
+        await client.disconnect()
+    topics: list[ForumTopicInfo] = []
+    for topic in getattr(result, "topics", []):
+        topic_id = getattr(topic, "id", None)
+        title = getattr(topic, "title", None)
+        if topic_id is None or title is None:
+            continue
+        topics.append(
+            ForumTopicInfo(
+                topic_id=int(topic_id),
+                title=str(title),
+                top_message=(
+                    int(getattr(topic, "top_message"))
+                    if getattr(topic, "top_message", None) is not None
+                    else None
+                ),
+                unread_count=int(getattr(topic, "unread_count", 0) or 0),
+                closed=bool(getattr(topic, "closed", False)),
+                hidden=bool(getattr(topic, "hidden", False)),
+                pinned=bool(getattr(topic, "pinned", False)),
+            )
+        )
+    return topics
+
+
 _RECONNECT_INITIAL_DELAY = 10
 _RECONNECT_MAX_DELAY = 300
 _RECONNECT_NETWORK_ERRORS = (ConnectionError, OSError)
@@ -447,16 +665,30 @@ async def run_daemon(config: Config) -> None:
         fallback_client=fallback_client,
     )
 
+    archive_runtime_enabled = _full_archive_runtime_enabled(config)
+    target_handlers: list[_TargetHandler] = []
     for target in config.targets:
         target_handler = _TargetHandler(
             config,
             client,
             target,
             realtime_queue=realtime_pusher.queue if realtime_pusher else None,
+            archive_relink_enabled=archive_runtime_enabled,
         )
+        target_handlers.append(target_handler)
         client.add_event_handler(
             target_handler.handle,
             events.NewMessage(chats=[target.target_chat_id]),
+        )
+    if archive_runtime_enabled:
+        full_archive_handler = _FullArchiveHandler(config)
+        client.add_event_handler(
+            full_archive_handler.handle,
+            events.NewMessage(chats=[config.full_archive.source_chat_id]),
+        )
+        client.add_event_handler(
+            full_archive_handler.handle,
+            events.MessageEdited(chats=[config.full_archive.source_chat_id]),
         )
     client.add_event_handler(
         control_handler.handle,
@@ -501,9 +733,32 @@ async def run_daemon(config: Config) -> None:
             await update_check_loop.stop()
         for loop in summary_loops:
             await loop.stop()
+        if target_handlers:
+            await asyncio.gather(
+                *(handler.drain_archive_relinks() for handler in target_handlers)
+            )
         if sender_client:
             await sender_client.disconnect()
         await client.disconnect()
+
+
+def _full_archive_runtime_enabled(config: Config) -> bool:
+    archive = config.full_archive
+    if not archive.enabled or archive.source_chat_id is None:
+        return False
+    report = inspect_archive_status(
+        archive.root_dir,
+        tracked_db_path=config.storage.db_path,
+    )
+    if not report.degraded:
+        return True
+    logger.warning(
+        "Full archive live capture disabled because archive health is degraded; "
+        "run archive-status and archive-repair --dry-run before restarting daemon."
+    )
+    for error in report.errors:
+        logger.warning("Full archive health error: %s", error)
+    return False
 
 
 def _build_client(config: Config) -> TelegramClient:
@@ -718,12 +973,46 @@ class _TargetHandler:
         target: TargetGroupConfig,
         *,
         realtime_queue: "asyncio.Queue[tuple[DbMessage, TargetGroupConfig]] | None" = None,
+        archive_relink_enabled: bool = True,
     ):
         self.config = config
         self.client = client
         self.target = target
         self._tracked = set(target.tracked_user_ids)
         self._realtime_queue = realtime_queue
+        self._archive_relink_enabled = archive_relink_enabled
+        self._archive_relink_tasks: set[asyncio.Task[None]] = set()
+
+    async def drain_archive_relinks(
+        self,
+        *,
+        timeout: float = ARCHIVE_RELINK_SHUTDOWN_TIMEOUT_SECONDS,
+    ) -> int:
+        if not self._archive_relink_tasks:
+            return 0
+        done, pending = await asyncio.wait(
+            tuple(self._archive_relink_tasks),
+            timeout=timeout,
+        )
+        for task in done:
+            self._archive_relink_tasks.discard(task)
+            if task.cancelled():
+                logger.warning("Full archive relink task was cancelled during shutdown")
+                continue
+            try:
+                task.result()
+            except Exception as exc:
+                logger.warning(
+                    "Full archive relink task failed during shutdown: %s",
+                    exc,
+                    exc_info=True,
+                )
+        if pending:
+            logger.warning(
+                "Full archive relink still pending at shutdown: %d task(s)",
+                len(pending),
+            )
+        return len(pending)
 
     async def handle(self, event: events.NewMessage.Event) -> None:
         msg = event.message
@@ -741,6 +1030,13 @@ class _TargetHandler:
         message, media = capture
         with db_session(self.config.storage.db_path) as conn:
             persist_message(conn, message, media)
+        if self._archive_relink_enabled:
+            _schedule_archive_relink_after_tracked_persist(
+                self.config,
+                msg,
+                message,
+                task_set=self._archive_relink_tasks,
+            )
         logger.info(
             "Captured message %s from %s",
             message.message_id,
@@ -762,6 +1058,294 @@ class _TargetHandler:
             )
             if db_msg is not None:
                 self._realtime_queue.put_nowait((db_msg, self.target))
+
+
+class _FullArchiveHandler:
+    def __init__(self, config: Config):
+        self.config = config
+
+    async def handle(self, event: events.NewMessage.Event) -> None:
+        try:
+            message = _archive_message_from_telegram(
+                event.message,
+                chat_id_default=self.config.full_archive.source_chat_id,
+            )
+            if message is None or not _archive_message_matches_scope(
+                self.config,
+                message,
+            ):
+                return
+            await asyncio.to_thread(
+                _persist_archive_message_to_storage,
+                self.config,
+                message,
+                tracked_db_path=self.config.storage.db_path,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Full archive capture failed without stopping watcher: %s",
+                exc,
+                exc_info=True,
+            )
+
+
+def _schedule_archive_relink_after_tracked_persist(
+    config: Config,
+    telegram_message: custom_message.Message,
+    stored_message: StoredMessage,
+    *,
+    task_set: set[asyncio.Task[None]] | None = None,
+) -> asyncio.Task[None] | None:
+    if not config.full_archive.enabled:
+        return None
+    task = asyncio.create_task(
+        _relink_archive_message_after_tracked_persist(
+            config,
+            telegram_message,
+            stored_message,
+        )
+    )
+    if task_set is not None:
+        task_set.add(task)
+        task.add_done_callback(task_set.discard)
+    return task
+
+
+async def _relink_archive_message_after_tracked_persist(
+    config: Config,
+    telegram_message: custom_message.Message,
+    stored_message: StoredMessage,
+) -> None:
+    if not config.full_archive.enabled:
+        return
+    try:
+        archive_message = _archive_message_from_telegram(
+            telegram_message,
+            chat_id_default=stored_message.chat_id,
+        )
+        if archive_message is None or not _archive_message_matches_scope(
+            config,
+            archive_message,
+        ):
+            return
+        await asyncio.to_thread(
+            _persist_archive_message_to_storage,
+            config,
+            archive_message,
+            tracked_db_path=config.storage.db_path,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Full archive relink failed after tracked persist: %s",
+            exc,
+            exc_info=True,
+        )
+
+
+def _archive_message_from_telegram(
+    message: custom_message.Message,
+    *,
+    chat_id_default: int | None = None,
+) -> ArchiveMessage | None:
+    message_id = _coerce_optional_int(getattr(message, "id", None))
+    date = _coerce_optional_datetime(getattr(message, "date", None))
+    chat_id = _coerce_optional_int(getattr(message, "chat_id", None))
+    if chat_id is None:
+        chat_id = _coerce_optional_int(chat_id_default)
+    if message_id is None or date is None or chat_id is None or chat_id == 0:
+        return None
+    topic_id = _archive_topic_id_for_message(message)
+    text = getattr(message, "message", None) or getattr(message, "raw_text", None)
+    raw_text = getattr(message, "raw_text", None) or text
+    sender_id = _coerce_optional_int(getattr(message, "sender_id", None))
+    return ArchiveMessage(
+        chat_id=chat_id,
+        message_id=message_id,
+        topic_id=topic_id,
+        sender_id=sender_id,
+        date=date,
+        text=text,
+        raw_text=raw_text,
+        message_kind="service" if getattr(message, "action", None) is not None else "message",
+        reply_to_msg_id=_coerce_optional_int(getattr(message, "reply_to_msg_id", None)),
+        reply_to_top_id=_reply_to_top_id_for_message(message),
+        is_forum_topic_link=bool(
+            getattr(getattr(message, "reply_to", None), "forum_topic", False)
+        ),
+        has_media=bool(getattr(message, "media", None)),
+        media=_archive_media_from_telegram(message),
+    )
+
+
+def _archive_message_matches_scope(config: Config, message: ArchiveMessage) -> bool:
+    archive = config.full_archive
+    if not archive.enabled or archive.source_chat_id is None:
+        return False
+    if message.chat_id != archive.source_chat_id:
+        return False
+    if archive.capture_scope == "topics":
+        return message.topic_id in set(archive.topic_ids)
+    return True
+
+
+def _archive_media_from_telegram(
+    message: custom_message.Message,
+) -> tuple[ArchiveMedia, ...]:
+    media = getattr(message, "media", None)
+    if media is None:
+        return ()
+    file_info = getattr(message, "file", None)
+    document = getattr(media, "document", None)
+    media_kind = type(media).__name__ or "media"
+    mime_type = (
+        getattr(file_info, "mime_type", None)
+        or getattr(media, "mime_type", None)
+        or getattr(document, "mime_type", None)
+    )
+    file_size = (
+        getattr(file_info, "size", None)
+        or getattr(media, "size", None)
+        or getattr(document, "size", None)
+    )
+    file_name = getattr(file_info, "name", None) or getattr(media, "file_name", None)
+    return (
+        ArchiveMedia(
+            media_index=0,
+            media_kind=str(media_kind),
+            mime_type=str(mime_type) if mime_type is not None else None,
+            file_size=_coerce_optional_int(file_size),
+            file_name=str(file_name) if file_name is not None else None,
+        ),
+    )
+
+
+def _persist_archive_message_to_storage(
+    config: Config,
+    message: ArchiveMessage,
+    *,
+    tracked_db_path: Path | None,
+) -> ArchivePersistResult:
+    archive = config.full_archive
+    manifest_path = archive.root_dir / "manifest.sqlite3"
+    manifest_conn = archive_connect(manifest_path)
+    try:
+        shard = find_shard_for_message(
+            manifest_conn,
+            archive.root_dir,
+            chat_id=message.chat_id,
+            message_date=message.date,
+            message_id=message.message_id,
+        )
+        if shard is None:
+            shard = select_shard(
+                manifest_conn,
+                archive.root_dir,
+                chat_id=message.chat_id,
+                message_date=message.date,
+                max_messages_per_shard=archive.max_messages_per_shard,
+                max_shard_size_bytes=archive.max_shard_size_bytes,
+            )
+        shard_conn = archive_connect(shard.path)
+        try:
+            previous_payload_mode = _archive_message_payload_mode(
+                shard_conn,
+                chat_id=message.chat_id,
+                message_id=message.message_id,
+            )
+            existed = previous_payload_mode is not None
+            persist_result = persist_archive_message_with_result(
+                shard_conn,
+                message,
+                tracked_db_path=tracked_db_path,
+                archive_root_dir=archive.root_dir,
+            )
+            payload_mode = persist_result.payload_mode
+        finally:
+            shard_conn.close()
+        if persist_result.created:
+            record_shard_write(manifest_conn, shard)
+        if tracked_db_path is not None:
+            record_tracked_db_link(
+                manifest_conn,
+                tracked_db_path,
+                archive_root_dir=archive.root_dir,
+            )
+        linked = (
+            payload_mode == "tracked_ref"
+            and previous_payload_mode != "tracked_ref"
+        )
+        return ArchivePersistResult(
+            payload_mode=payload_mode,
+            created=persist_result.created,
+            linked=linked,
+        )
+    finally:
+        manifest_conn.close()
+
+
+def _archive_message_payload_mode(
+    conn: sqlite3.Connection,
+    *,
+    chat_id: int,
+    message_id: int,
+) -> str | None:
+    if not archive_message_exists(conn, chat_id=chat_id, message_id=message_id):
+        return None
+    row = conn.execute(
+        """
+        SELECT payload_mode
+        FROM archive_messages
+        WHERE chat_id = ? AND message_id = ?
+        LIMIT 1
+        """,
+        (chat_id, message_id),
+    ).fetchone()
+    return str(row["payload_mode"]) if row is not None else None
+
+
+def _archive_topic_id_for_message(message: custom_message.Message) -> int | None:
+    top_id = _reply_to_top_id_for_message(message)
+    normalized_top_id = _normalize_archive_topic_id(top_id)
+    if normalized_top_id is not None:
+        return normalized_top_id
+    reply_to = getattr(message, "reply_to", None)
+    if reply_to is None or not bool(getattr(reply_to, "forum_topic", False)):
+        return None
+    reply_to_msg_id = getattr(message, "reply_to_msg_id", None) or getattr(
+        reply_to,
+        "reply_to_msg_id",
+        None,
+    )
+    return _normalize_archive_topic_id(_coerce_optional_int(reply_to_msg_id))
+
+
+def _reply_to_top_id_for_message(message: custom_message.Message) -> int | None:
+    reply_to = getattr(message, "reply_to", None)
+    if reply_to is None:
+        return None
+    top_id = getattr(reply_to, "reply_to_top_id", None)
+    return _coerce_optional_int(top_id)
+
+
+def _normalize_archive_topic_id(value: int | None) -> int | None:
+    if value is None or value <= 1:
+        return None
+    return value
+
+
+def _coerce_optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_optional_datetime(value: object) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+    return _ensure_tz(value)
 
 
 class _RealtimePusher:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 from types import MappingProxyType
@@ -91,6 +91,12 @@ class NotificationConfig:
 
 
 VALID_PUSH_MODES = ("interval", "realtime")
+VALID_FULL_ARCHIVE_SCOPES = ("whole_group", "topics")
+VALID_FULL_ARCHIVE_SHARD_POLICIES = ("monthly",)
+DEFAULT_FULL_ARCHIVE_ROOT = "data/full_archive"
+DEFAULT_FULL_ARCHIVE_MAX_MESSAGES_PER_SHARD = 500_000
+DEFAULT_FULL_ARCHIVE_MAX_SHARD_SIZE_MB = 1024
+DEFAULT_FULL_ARCHIVE_BACKFILL_LIMIT_MESSAGES = 10_000
 
 
 @dataclass(frozen=True)
@@ -104,6 +110,37 @@ class RealtimeConfig:
     media_extra_delay_sec: float
     warmup_minutes: float
     warmup_rate: int
+
+
+@dataclass(frozen=True)
+class FullArchiveConfig:
+    enabled: bool
+    root_dir: Path
+    source_chat_id: int | None
+    capture_scope: str
+    topic_ids: tuple[int, ...]
+    shard_policy: str
+    max_messages_per_shard: int
+    max_shard_size_mb: int
+    backfill_limit_messages: int
+
+    @property
+    def max_shard_size_bytes(self) -> int:
+        return self.max_shard_size_mb * 1024 * 1024
+
+    @classmethod
+    def disabled(cls) -> "FullArchiveConfig":
+        return cls(
+            enabled=False,
+            root_dir=Path(DEFAULT_FULL_ARCHIVE_ROOT),
+            source_chat_id=None,
+            capture_scope="whole_group",
+            topic_ids=(),
+            shard_policy="monthly",
+            max_messages_per_shard=DEFAULT_FULL_ARCHIVE_MAX_MESSAGES_PER_SHARD,
+            max_shard_size_mb=DEFAULT_FULL_ARCHIVE_MAX_SHARD_SIZE_MB,
+            backfill_limit_messages=DEFAULT_FULL_ARCHIVE_BACKFILL_LIMIT_MESSAGES,
+        )
 
 
 @dataclass(frozen=True)
@@ -122,6 +159,7 @@ class Config:
     display: DisplayConfig
     notifications: NotificationConfig
     realtime: RealtimeConfig
+    full_archive: FullArchiveConfig = field(default_factory=FullArchiveConfig.disabled)
 
     @property
     def effective_language(self) -> str:
@@ -234,6 +272,7 @@ def load_config(path: Path) -> Config:
     display_cfg = _parse_display(data.get("display") or {})
     notifications_cfg = _parse_notifications(data.get("notifications") or {})
     realtime_cfg = _parse_realtime(data.get("realtime") or {})
+    full_archive_cfg = _parse_full_archive(data.get("full_archive"), base_dir)
 
     target_by_chat: dict[int, TargetGroupConfig] = {}
     target_by_name: dict[str, TargetGroupConfig] = {}
@@ -274,6 +313,7 @@ def load_config(path: Path) -> Config:
         display=display_cfg,
         notifications=notifications_cfg,
         realtime=realtime_cfg,
+        full_archive=full_archive_cfg,
     )
 
 
@@ -745,6 +785,100 @@ def _parse_realtime(raw: dict[str, Any]) -> RealtimeConfig:
     )
 
 
+def _parse_full_archive(raw: dict[str, Any] | None, base_dir: Path) -> FullArchiveConfig:
+    root_dir = _resolve_path(DEFAULT_FULL_ARCHIVE_ROOT, base_dir)
+    if raw is None:
+        return FullArchiveConfig(
+            enabled=False,
+            root_dir=root_dir,
+            source_chat_id=None,
+            capture_scope="whole_group",
+            topic_ids=(),
+            shard_policy="monthly",
+            max_messages_per_shard=DEFAULT_FULL_ARCHIVE_MAX_MESSAGES_PER_SHARD,
+            max_shard_size_mb=DEFAULT_FULL_ARCHIVE_MAX_SHARD_SIZE_MB,
+            backfill_limit_messages=DEFAULT_FULL_ARCHIVE_BACKFILL_LIMIT_MESSAGES,
+        )
+    if not isinstance(raw, dict):
+        raise ConfigError("full_archive must be a table")
+    if "retention_days" in raw:
+        raise ConfigError(
+            "full_archive.retention_days is not supported yet; "
+            "delete archive shards or root_dir manually"
+        )
+
+    enabled_raw = raw.get("enabled", False)
+    if not isinstance(enabled_raw, bool):
+        raise ConfigError("full_archive.enabled must be a boolean")
+    enabled = enabled_raw
+    root_dir = _resolve_path(raw.get("root_dir", DEFAULT_FULL_ARCHIVE_ROOT), base_dir)
+    capture_scope = str(raw.get("capture_scope", "whole_group")).strip().lower()
+    if capture_scope not in VALID_FULL_ARCHIVE_SCOPES:
+        raise ConfigError(
+            f"full_archive.capture_scope must be one of {VALID_FULL_ARCHIVE_SCOPES!r}, "
+            f"got '{capture_scope}'"
+        )
+    shard_policy = str(raw.get("shard_policy", "monthly")).strip().lower()
+    if shard_policy not in VALID_FULL_ARCHIVE_SHARD_POLICIES:
+        raise ConfigError(
+            "full_archive.shard_policy currently supports only 'monthly'"
+        )
+
+    max_messages = _require_int(
+        raw.get("max_messages_per_shard", DEFAULT_FULL_ARCHIVE_MAX_MESSAGES_PER_SHARD),
+        "full_archive.max_messages_per_shard",
+    )
+    if max_messages <= 0:
+        raise ConfigError("full_archive.max_messages_per_shard must be > 0")
+    max_size_mb = _require_int(
+        raw.get("max_shard_size_mb", DEFAULT_FULL_ARCHIVE_MAX_SHARD_SIZE_MB),
+        "full_archive.max_shard_size_mb",
+    )
+    if max_size_mb <= 0:
+        raise ConfigError("full_archive.max_shard_size_mb must be > 0")
+    backfill_limit = _require_int(
+        raw.get(
+            "backfill_limit_messages",
+            DEFAULT_FULL_ARCHIVE_BACKFILL_LIMIT_MESSAGES,
+        ),
+        "full_archive.backfill_limit_messages",
+    )
+    if backfill_limit < 0:
+        raise ConfigError("full_archive.backfill_limit_messages must be >= 0")
+
+    source_chat_id: int | None = None
+    if "source_chat_id" in raw and raw["source_chat_id"] is not None:
+        source_chat_id = _require_int(raw["source_chat_id"], "full_archive.source_chat_id")
+    topic_ids = _parse_int_tuple(raw.get("topic_ids", ()), "full_archive.topic_ids")
+    if any(topic_id <= 1 for topic_id in topic_ids):
+        raise ConfigError(
+            "full_archive.topic_ids values must be Telegram forum topic IDs > 1; "
+            "use capture_scope = 'whole_group' for General"
+        )
+
+    if enabled:
+        if source_chat_id is None:
+            raise ConfigError("full_archive.source_chat_id is required when enabled = true")
+        if source_chat_id == 0:
+            raise ConfigError("full_archive.source_chat_id must not be 0")
+        if capture_scope == "topics" and not topic_ids:
+            raise ConfigError(
+                "full_archive.topic_ids is required when capture_scope = 'topics'"
+            )
+
+    return FullArchiveConfig(
+        enabled=enabled,
+        root_dir=root_dir,
+        source_chat_id=source_chat_id,
+        capture_scope=capture_scope,
+        topic_ids=topic_ids,
+        shard_policy=shard_policy,
+        max_messages_per_shard=max_messages,
+        max_shard_size_mb=max_size_mb,
+        backfill_limit_messages=backfill_limit,
+    )
+
+
 def _parse_bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
@@ -771,6 +905,17 @@ def _require_float(value: Any, label: str) -> float:
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"{label} must be a number") from exc
     return parsed
+
+
+def _parse_int_tuple(value: Any, label: str) -> tuple[int, ...]:
+    if value in (None, ""):
+        return ()
+    if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
+        raise ConfigError(f"{label} must be a list of integers")
+    try:
+        return tuple(int(item) for item in value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{label} must be a list of integers") from exc
 
 
 def _resolve_path(raw_path: Any, base_dir: Path) -> Path:

@@ -30,3 +30,6 @@ version = {attr = "telegram_watch.__version__"}
 
 [tool.setuptools.packages.find]
 include = ["telegram_watch*", "tgwatch*"]
+
+[tool.setuptools.package-data]
+telegram_watch = ["templates/*.md"]

@@ -193,7 +193,48 @@ L7 | **起動ウォームアップ** — 起動後数分間は送信レートを
 
 デフォルトのままでも任意の書き込み可能なパスでも構いません。`doctor` が作成可否と書き込み権限を確認します。
 
-## 8. レポート（`[reporting]`）
+## 8. 任意の全量アーカイブ（`[full_archive]`）
+
+全量アーカイブは任意のローカル文脈レイヤーで、既定では無効です。有効にすると、tgwatch は指定したソースグループまたは指定した forum Topic を `root_dir` 配下の独立した SQLite manifest とシャードへ静かに記録します。既存の tracked-user 通知とレポートは引き続き通常の tracked DB を使用します。
+
+項目 | 説明 | 既定値
+----- | ---- | ------
+`enabled` | アーカイブ writer と `archive-backfill --apply` の書き込みを有効化します。 | `false`
+`root_dir` | `manifest.sqlite3` とアーカイブシャードの保存先。アーカイブデータを消したい場合は単独で削除できます。 | `data/full_archive`
+`source_chat_id` | アーカイブするグループ/チャンネル ID。`enabled = true` では必須で、`0` は不可です。tracked メッセージの文脈を復元できるよう、いずれかの `targets[].target_chat_id` を推奨します。一致しない場合、`doctor` と GUI は warning を表示します。 | （空）
+`capture_scope` | `"whole_group"` はソースグループ全体、`"topics"` は `topic_ids` のみをアーカイブします。 | `"whole_group"`
+`topic_ids` | `enabled = true` かつ `capture_scope = "topics"` のときにアーカイブする Topic ID。無効な設定では下書きとして空のまま保存できます。値は `1` より大きい必要があります。General Topic `1` は `capture_scope = "whole_group"` で扱います。ID の確認には `tgwatch list-topics --config config.toml --chat <chat_id>` を使います。 | `[]`
+`shard_policy` | 現在は `"monthly"` のみ対応します。 | `"monthly"`
+`max_messages_per_shard` | 1 つの月次シャードがこの件数に達したら番号付きシャードへ切り替えます。 | `500000`
+`max_shard_size_mb` | 1 つのシャードがこのサイズに達したら番号付きシャードへ切り替えます。 | `1024`
+`backfill_limit_messages` | `--limit` を省略したときの `archive-backfill` の既定スキャン上限。`0` は既定 backfill を no-op にし、明示的な `--limit` がない限り実行しません。 | `10000`
+
+このフェーズでは自動保持期間はサポートしません。`full_archive.retention_days` は設定しないでください。整理する場合は、対象 shard、group ディレクトリ、または `root_dir` 全体を手動で削除します。
+
+`root_dir` 全体を削除しても、任意アーカイブ層だけがリセットされます。その後 `archive-status` は empty を表示し、`archive-context` は読み取り専用のままアーカイブ行なしを返します。次の live capture または `archive-backfill --apply` が新しい空状態から manifest/shard を再作成します。一部の shard や group ディレクトリだけを削除した場合、古い manifest は残ります。意図した削除だと確認した後、`archive-repair --prune-missing-shards --apply` で欠落ファイルに対応する manifest 行を整理できます。
+
+よく使うコマンド：
+
+```bash
+python -m tgwatch list-topics --config config.toml --chat -1001234567890
+python -m tgwatch archive-status --config config.toml
+python -m tgwatch archive-qa-init --config config.toml
+python -m tgwatch archive-repair --config config.toml --dry-run
+python -m tgwatch archive-repair --config config.toml --prune-missing-shards --apply
+python -m tgwatch archive-context --config config.toml --chat -1001234567890 --message-id 12345
+python -m tgwatch archive-backfill --config config.toml --limit 100 --dry-run
+python -m tgwatch archive-backfill --config config.toml --limit 100 --apply
+```
+
+`archive-backfill` は既定で dry-run です。`--apply` を付けた場合のみアーカイブ行を書き込みます。`--limit 0` は成功する no-op で、Telegram に接続しません。
+`list-topics` は通常 Topic を `topic_ids` に使えるものとして表示し、General (`1`) は `whole_group` として表示します。`1` を `full_archive.topic_ids` に入れないでください。
+`archive-qa-init` は `reports/full_archive_qa/` 配下に、伏せ字を前提にした実 Telegram QA 下書きを作成します。`reports/` は `.gitignore` で除外されています。
+`archive-status` は読み取り専用コマンドです。full archive が無効な場合は disabled を表示するだけで、アーカイブファイルを作成してはいけません。
+`archive-repair` は既定で dry-run です。`--apply` を付けた場合のみ、必須 shard index や manifest shard count など、ローカルの事実から再構築できるアーカイブ metadata を修復します。
+shard ファイルや group ディレクトリを手動削除した後は、`archive-repair --prune-missing-shards --apply` で古い manifest 行を整理します。このコマンドは、すでに欠落しているファイルに対応する manifest レコードだけを削除し、shard ファイル、tracked DB、メディアファイルは削除しません。`root_dir` 全体を削除した場合は次の書き込みが新しいアーカイブとして扱うため、書き込み前の repair は不要です。
+`archive-context` は読み取り専用コマンドで、tracked message の前後にあるアーカイブ済みタイムラインを表示します。
+
+## 9. レポート（`[reporting]`）
 
 項目 | 説明 | 既定値
 ----- | ---- | ------
@@ -204,7 +245,7 @@ L7 | **起動ウォームアップ** — 起動後数分間は送信レートを
 
 各ウィンドウで HTML レポートを生成し、コントロールチャットへ送信後、メッセージ（引用・メディア含む）を送ります。
 
-## 9. 表示（`[display]`）
+## 10. 表示（`[display]`）
 
 項目 | 説明 | 既定値
 ----- | ---- | ------
@@ -212,7 +253,7 @@ L7 | **起動ウォームアップ** — 起動後数分間は送信レートを
 `time_format` | 時刻表示（strftime）。GUI ではこの項目は年・月・日・時・分・秒・日付区切り・タイムゾーンのドロップダウンで構成されるビルダーになり、既存の非ビルダー形式はカスタム値として保持されます。 | `%Y.%m.%d %H:%M:%S (%Z)`
 `language` | プッシュメッセージの言語：`"auto"`（システムロケールから自動検出）、`"zh"`、または `"en"`。GUI でも使用されます。 | `"auto"`
 
-## 10. 通知（`[notifications]`）
+## 11. 通知（`[notifications]`）
 
 項目 | 説明 | 既定値
 ----- | ---- | ------
@@ -220,7 +261,7 @@ L7 | **起動ウォームアップ** — 起動後数分間は送信レートを
 `heartbeat_interval_hours` | 非アクティブ状態が続いた場合に「まだ実行中」のハートビートを送信するまでの時間数。`0` で無効化。 | `2`
 `check_updates` | 24 時間ごとに GitHub の新リリースを自動チェックし、コントロールグループに通知します。 | `true`
 
-## 11. 設定の検証
+## 12. 設定の検証
 
 編集後に次を実行：
 

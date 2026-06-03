@@ -3,7 +3,7 @@
 [English](README.md) | [简体中文](docs/README.zh-Hans.md) | [繁體中文](docs/README.zh-Hant.md) | [日本語](docs/README.ja.md)
 
 [![Release](https://img.shields.io/github/v/release/o1xhack/telegram-watch?style=for-the-badge&label=release&color=7c3aed)](https://github.com/o1xhack/telegram-watch/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/o1xhack/telegram-watch/total?style=for-the-badge&label=downloads&color=7c3aed)](https://github.com/o1xhack/telegram-watch/releases)
+[![Stars](https://img.shields.io/github/stars/o1xhack/telegram-watch?style=for-the-badge&label=stars&color=7c3aed)](https://github.com/o1xhack/telegram-watch/stargazers)
 [![License](https://img.shields.io/github/license/o1xhack/telegram-watch?style=for-the-badge&label=license&color=7c3aed)](LICENSE)
 
 [![GitHub Sponsors](https://img.shields.io/badge/GitHub%20Sponsors-o1xhack-ea4aaa?style=for-the-badge&logo=githubsponsors&logoColor=white)](https://github.com/sponsors/o1xhack)
