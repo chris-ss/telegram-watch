@@ -211,7 +211,7 @@ async def run_once(
     finally:
         await client.disconnect()
     until = utc_now()
-    report_now = utc_now()
+    report_now = utc_now().astimezone(config.reporting.timezone)
     once_report_dir = (
         config.reporting.reports_dir
         / report_now.strftime("%Y-%m-%d")
@@ -1235,7 +1235,16 @@ def _persist_archive_message_to_storage(
             chat_id=message.chat_id,
             message_date=message.date,
             message_id=message.message_id,
+            shard_timezone=config.reporting.timezone,
         )
+        if shard is None and config.reporting.timezone != timezone.utc:
+            shard = find_shard_for_message(
+                manifest_conn,
+                archive.root_dir,
+                chat_id=message.chat_id,
+                message_date=message.date,
+                message_id=message.message_id,
+            )
         if shard is None:
             shard = select_shard(
                 manifest_conn,
@@ -1244,6 +1253,7 @@ def _persist_archive_message_to_storage(
                 message_date=message.date,
                 max_messages_per_shard=archive.max_messages_per_shard,
                 max_shard_size_bytes=archive.max_shard_size_bytes,
+                shard_timezone=config.reporting.timezone,
             )
         shard_conn = archive_connect(shard.path)
         try:

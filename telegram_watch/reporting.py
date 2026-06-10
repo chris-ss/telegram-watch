@@ -42,7 +42,7 @@ def generate_report(
 ) -> Path:
     """Generate HTML report and return the file path."""
     if report_dir is None:
-        now = utc_now()
+        now = utc_now().astimezone(config.reporting.timezone)
         report_dir = (
             config.reporting.reports_dir
             / now.strftime("%Y-%m-%d")

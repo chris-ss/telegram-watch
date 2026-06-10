@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, tzinfo
 import os
 from pathlib import Path
 import sqlite3
@@ -369,10 +369,11 @@ def select_shard(
     message_date: datetime,
     max_messages_per_shard: int,
     max_shard_size_bytes: int,
+    shard_timezone: tzinfo = timezone.utc,
 ) -> ArchiveShard:
     """Return an active group-month shard, creating/rotating as needed."""
     ensure_manifest_schema(conn)
-    starts_at, ends_at = _month_bounds(message_date)
+    starts_at, ends_at = _month_bounds(message_date, shard_timezone)
     starts_raw = _serialize_dt(starts_at)
     rows = conn.execute(
         """
@@ -700,9 +701,10 @@ def find_shard_for_message(
     chat_id: int,
     message_date: datetime,
     message_id: int,
+    shard_timezone: tzinfo = timezone.utc,
 ) -> ArchiveShard | None:
     ensure_manifest_schema(conn)
-    starts_at, _ = _month_bounds(message_date)
+    starts_at, _ = _month_bounds(message_date, shard_timezone)
     rows = conn.execute(
         """
         SELECT *
@@ -2187,8 +2189,11 @@ def _tracked_message_exists(db_path: Path, chat_id: int, message_id: int) -> boo
         conn.close()
 
 
-def _month_bounds(dt: datetime) -> tuple[datetime, datetime]:
-    dt = _ensure_utc(dt)
+def _month_bounds(
+    dt: datetime,
+    shard_timezone: tzinfo = timezone.utc,
+) -> tuple[datetime, datetime]:
+    dt = _ensure_utc(dt).astimezone(shard_timezone)
     start = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     if start.month == 12:
         end = start.replace(year=start.year + 1, month=1)
