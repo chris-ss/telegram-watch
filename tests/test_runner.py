@@ -3189,6 +3189,79 @@ async def test_run_once_multi_target_generates_unique_report_files(monkeypatch, 
 
 
 @pytest.mark.asyncio
+async def test_run_once_push_passes_primary_fallback_when_sender_is_active(
+    monkeypatch, tmp_path: Path
+):
+    config = build_config(tmp_path)
+    since = datetime.now(timezone.utc) - timedelta(hours=1)
+
+    class DummyClient:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.disconnected = False
+
+        async def disconnect(self) -> None:
+            self.disconnected = True
+
+    capture_primary = DummyClient("capture-primary")
+    fallback_primary = DummyClient("fallback-primary")
+    sender = DummyClient("sender")
+    built_clients = iter([capture_primary, fallback_primary])
+    pushed: dict[str, object] = {}
+
+    @contextmanager
+    def fake_db_session(_path: Path):
+        yield object()
+
+    async def fake_start_client(_client, _role):
+        return None
+
+    async def fake_collect_window(_client, _config, _target, _since):
+        return []
+
+    async def fake_start_sender_client(_config):
+        return sender
+
+    def fake_fetch_messages_between(_conn, _ids, _since, _until, **_kwargs):
+        return []
+
+    def fake_generate_report(_messages, _config, _since, _until, **kwargs):
+        return kwargs["report_dir"] / kwargs["report_name"]
+
+    async def fake_push_once_reports(
+        client,
+        _config,
+        _targets,
+        _stored_by_target,
+        _since,
+        _until,
+        _report_paths,
+        *,
+        fallback_client=None,
+        **_kwargs,
+    ):
+        pushed["client"] = client
+        pushed["fallback_client"] = fallback_client
+
+    monkeypatch.setattr(runner, "_build_client", lambda _config: next(built_clients))
+    monkeypatch.setattr(runner, "_start_client", fake_start_client)
+    monkeypatch.setattr(runner, "_start_sender_client", fake_start_sender_client)
+    monkeypatch.setattr(runner, "_collect_window", fake_collect_window)
+    monkeypatch.setattr(runner, "db_session", fake_db_session)
+    monkeypatch.setattr(runner, "persist_message", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runner, "fetch_messages_between", fake_fetch_messages_between)
+    monkeypatch.setattr(runner, "generate_report", fake_generate_report)
+    monkeypatch.setattr(runner, "_push_once_reports", fake_push_once_reports)
+
+    await runner.run_once(config, since, push=True)
+
+    assert pushed == {"client": sender, "fallback_client": fallback_primary}
+    assert capture_primary.disconnected is True
+    assert sender.disconnected is True
+    assert fallback_primary.disconnected is True
+
+
+@pytest.mark.asyncio
 async def test_run_once_selected_target_in_multi_target_config_uses_scoped_filename(
     monkeypatch, tmp_path: Path
 ):
@@ -3729,6 +3802,187 @@ def test_extract_time_format_strips_date() -> None:
 
 
 # --- Reconnect logic tests ---
+
+
+class _FakeSendClient:
+    def __init__(
+        self,
+        *,
+        connected: bool = True,
+        fail_after_connect: bool = False,
+        fail_messages: set[str] | None = None,
+        fail_entities: set[object] | None = None,
+    ) -> None:
+        self.connected = connected
+        self.fail_after_connect = fail_after_connect
+        self.fail_messages = set(fail_messages or ())
+        self.fail_entities = set(fail_entities or ())
+        self.connect_count = 0
+        self.sent_messages: list[tuple[object, str]] = []
+        self.sent_files: list[tuple[object, Path]] = []
+
+    async def connect(self) -> None:
+        self.connect_count += 1
+        self.connected = True
+
+    async def get_input_entity(self, entity):
+        return f"resolved:{entity}"
+
+    async def send_message(self, entity, message, **_kwargs) -> None:
+        if (
+            not self.connected
+            or self.fail_after_connect
+            or message in self.fail_messages
+            or entity in self.fail_entities
+        ):
+            raise RuntimeError("Cannot send requests while disconnected")
+        self.sent_messages.append((entity, message))
+
+    async def send_file(self, entity, *, file, **_kwargs) -> None:
+        if not self.connected or self.fail_after_connect:
+            raise RuntimeError("Cannot send requests while disconnected")
+        self.sent_files.append((entity, Path(file)))
+
+
+@pytest.mark.asyncio
+async def test_send_message_reconnects_sender_before_primary_fallback() -> None:
+    sender = _FakeSendClient(connected=False)
+    primary = _FakeSendClient()
+
+    await runner._send_message_with_fallback(sender, primary, "control", "hello")
+
+    assert sender.connect_count == 1
+    assert sender.sent_messages == [("resolved:control", "hello")]
+    assert primary.sent_messages == []
+
+
+@pytest.mark.asyncio
+async def test_send_file_reconnects_sender_before_primary_fallback(tmp_path: Path) -> None:
+    sender = _FakeSendClient(connected=False)
+    primary = _FakeSendClient()
+    attachment = tmp_path / "report.txt"
+    attachment.write_text("report", encoding="utf-8")
+
+    await runner._send_file_with_fallback(sender, primary, "control", attachment)
+
+    assert sender.connect_count == 1
+    assert sender.sent_files == [("resolved:control", attachment)]
+    assert primary.sent_files == []
+
+
+@pytest.mark.asyncio
+async def test_send_message_falls_back_to_primary_when_sender_retry_fails() -> None:
+    sender = _FakeSendClient(connected=False, fail_after_connect=True)
+    primary = _FakeSendClient()
+
+    await runner._send_message_with_fallback(sender, primary, "control", "hello")
+
+    assert sender.connect_count == 1
+    assert sender.sent_messages == []
+    assert primary.sent_messages == [
+        ("resolved:control", "hello"),
+        ("resolved:control", runner._SENDER_FALLBACK_ALERT),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_send_file_fallback_warns_control_chat_when_sender_retry_fails(tmp_path: Path) -> None:
+    sender = _FakeSendClient(connected=False, fail_after_connect=True)
+    primary = _FakeSendClient()
+    attachment = tmp_path / "report.txt"
+    attachment.write_text("report", encoding="utf-8")
+
+    await runner._send_file_with_fallback(sender, primary, "control", attachment)
+
+    assert sender.connect_count == 1
+    assert sender.sent_files == []
+    assert primary.sent_files == [("resolved:control", attachment)]
+    assert primary.sent_messages == [("resolved:control", runner._SENDER_FALLBACK_ALERT)]
+
+
+@pytest.mark.asyncio
+async def test_sender_fallback_alert_is_sent_once_until_sender_recovers() -> None:
+    sender = _FakeSendClient(connected=False, fail_after_connect=True)
+    primary = _FakeSendClient()
+
+    await runner._send_message_with_fallback(sender, primary, "control", "first")
+    await runner._send_message_with_fallback(sender, primary, "control", "second")
+
+    assert primary.sent_messages == [
+        ("resolved:control", "first"),
+        ("resolved:control", runner._SENDER_FALLBACK_ALERT),
+        ("resolved:control", "second"),
+    ]
+
+    sender.fail_after_connect = False
+    await runner._send_message_with_fallback(sender, primary, "control", "recovered")
+
+    sender.fail_after_connect = True
+    sender.connected = False
+    await runner._send_message_with_fallback(sender, primary, "control", "third")
+
+    assert primary.sent_messages == [
+        ("resolved:control", "first"),
+        ("resolved:control", runner._SENDER_FALLBACK_ALERT),
+        ("resolved:control", "second"),
+        ("resolved:control", "third"),
+        ("resolved:control", runner._SENDER_FALLBACK_ALERT),
+    ]
+    assert sender.sent_messages == [("resolved:control", "recovered")]
+
+
+@pytest.mark.asyncio
+async def test_sender_fallback_alert_is_throttled_per_control_chat() -> None:
+    sender = _FakeSendClient(connected=False, fail_after_connect=True)
+    primary = _FakeSendClient()
+
+    await runner._send_message_with_fallback(sender, primary, "control-a", "first")
+    await runner._send_message_with_fallback(sender, primary, "control-b", "second")
+    await runner._send_message_with_fallback(sender, primary, "control-a", "third")
+
+    assert primary.sent_messages == [
+        ("resolved:control-a", "first"),
+        ("resolved:control-a", runner._SENDER_FALLBACK_ALERT),
+        ("resolved:control-b", "second"),
+        ("resolved:control-b", runner._SENDER_FALLBACK_ALERT),
+        ("resolved:control-a", "third"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sender_fallback_recovery_only_clears_recovered_control_chat() -> None:
+    sender = _FakeSendClient(connected=True, fail_entities={"resolved:control-a"})
+    primary = _FakeSendClient()
+
+    await runner._send_message_with_fallback(sender, primary, "control-a", "first")
+    await runner._send_message_with_fallback(sender, primary, "control-b", "second")
+    await runner._send_message_with_fallback(sender, primary, "control-a", "third")
+
+    assert sender.sent_messages == [("resolved:control-b", "second")]
+    assert primary.sent_messages == [
+        ("resolved:control-a", "first"),
+        ("resolved:control-a", runner._SENDER_FALLBACK_ALERT),
+        ("resolved:control-a", "third"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sender_fallback_alert_retries_after_alert_delivery_failure() -> None:
+    sender = _FakeSendClient(connected=False, fail_after_connect=True)
+    primary = _FakeSendClient(fail_messages={runner._SENDER_FALLBACK_ALERT})
+
+    await runner._send_message_with_fallback(sender, primary, "control", "first")
+
+    assert primary.sent_messages == [("resolved:control", "first")]
+
+    primary.fail_messages.clear()
+    await runner._send_message_with_fallback(sender, primary, "control", "second")
+
+    assert primary.sent_messages == [
+        ("resolved:control", "first"),
+        ("resolved:control", "second"),
+        ("resolved:control", runner._SENDER_FALLBACK_ALERT),
+    ]
 
 
 class _FakeClient:
