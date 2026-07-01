@@ -58,6 +58,12 @@ from .timeutils import parse_since_spec, utc_now
 
 logger = logging.getLogger(__name__)
 
+_SENDER_FALLBACK_ALERT = (
+    "\u26a0\ufe0f Sender account is unavailable after reconnect retry; "
+    "using the primary account for outgoing control messages. "
+    "Check the sender session and restart the daemon if this persists."
+)
+
 ARCHIVE_BACKFILL_WAIT_THRESHOLD = 1_000
 ARCHIVE_BACKFILL_WAIT_TIME_SECONDS = 1.0
 ARCHIVE_RELINK_SHUTDOWN_TIMEOUT_SECONDS = 5.0
@@ -249,45 +255,30 @@ async def run_once(
         report_paths.append(report_path)
     if push:
         sender_client = await _start_sender_client(config)
-        send_client = sender_client
-        sender_active = sender_client is not None
-        if send_client is None:
+        fallback_client: TelegramClient | None = None
+        if sender_client is None:
             send_client = _build_client(config)
             await _start_client(send_client, "primary")
+        else:
+            send_client = sender_client
+            fallback_client = _build_client(config)
+            await _start_client(fallback_client, "primary")
         try:
-                await _push_once_reports(
-                    send_client,
-                    config,
-                    targets,
-                    stored_by_target,
-                    since,
-                    until,
-                    report_paths,
+            await _push_once_reports(
+                send_client,
+                config,
+                targets,
+                stored_by_target,
+                since,
+                until,
+                report_paths,
                 bark_context=(f"(since {since_label})" if since_label else None),
+                fallback_client=fallback_client,
             )
-        except Exception:
-            if sender_active:
-                logger.warning("Sender account failed; retrying report push with primary account.")
-                await send_client.disconnect()
-                primary = _build_client(config)
-                await primary.start()
-                try:
-                        await _push_once_reports(
-                            primary,
-                            config,
-                            targets,
-                            stored_by_target,
-                            since,
-                            until,
-                            report_paths,
-                        bark_context=(f"(since {since_label})" if since_label else None),
-                    )
-                finally:
-                    await primary.disconnect()
-                return report_paths
-            raise
         finally:
             await send_client.disconnect()
+            if fallback_client is not None:
+                await fallback_client.disconnect()
     return report_paths
 
 
@@ -2488,12 +2479,21 @@ async def _send_message_with_fallback(
 ) -> None:
     try:
         await _send_with_backoff(client, entity, message, on_flood_wait=on_flood_wait, **kwargs)
+        _mark_sender_fallback_recovered(client, entity)
         return
     except Exception as exc:
         if fallback_client is None or fallback_client is client:
             raise
-        logger.warning("Sender failed to send message; retrying with primary: %s", exc)
+        logger.warning("Sender failed to send message; reconnecting sender before fallback: %s", exc)
+        try:
+            await _reconnect_send_client(client)
+            await _send_with_backoff(client, entity, message, on_flood_wait=on_flood_wait, **kwargs)
+            _mark_sender_fallback_recovered(client, entity)
+            return
+        except Exception as retry_exc:
+            logger.warning("Sender reconnect/retry failed for message; retrying with primary: %s", retry_exc)
     await _send_with_backoff(fallback_client, entity, message, on_flood_wait=on_flood_wait, **kwargs)
+    await _send_sender_fallback_alert(client, fallback_client, entity, on_flood_wait=on_flood_wait)
 
 
 async def _send_file_with_fallback(
@@ -2506,12 +2506,64 @@ async def _send_file_with_fallback(
 ) -> None:
     try:
         await _send_file_with_backoff(client, entity, file_path, on_flood_wait=on_flood_wait, **kwargs)
+        _mark_sender_fallback_recovered(client, entity)
         return
     except Exception as exc:
         if fallback_client is None or fallback_client is client:
             raise
-        logger.warning("Sender failed to send file; retrying with primary: %s", exc)
+        logger.warning("Sender failed to send file; reconnecting sender before fallback: %s", exc)
+        try:
+            await _reconnect_send_client(client)
+            await _send_file_with_backoff(client, entity, file_path, on_flood_wait=on_flood_wait, **kwargs)
+            _mark_sender_fallback_recovered(client, entity)
+            return
+        except Exception as retry_exc:
+            logger.warning("Sender reconnect/retry failed for file; retrying with primary: %s", retry_exc)
     await _send_file_with_backoff(fallback_client, entity, file_path, on_flood_wait=on_flood_wait, **kwargs)
+    await _send_sender_fallback_alert(client, fallback_client, entity, on_flood_wait=on_flood_wait)
+
+
+async def _reconnect_send_client(client: TelegramClient) -> None:
+    connect = getattr(client, "connect", None)
+    if connect is None:
+        return
+    await connect()
+
+
+def _mark_sender_fallback_recovered(client: TelegramClient, entity: int | str) -> None:
+    alerted = getattr(client, "_tgwatch_sender_fallback_alert_sent", None)
+    if isinstance(alerted, set):
+        alerted.discard(_sender_fallback_alert_key(entity))
+
+
+async def _send_sender_fallback_alert(
+    sender_client: TelegramClient,
+    fallback_client: TelegramClient,
+    entity: int | str,
+    *,
+    on_flood_wait: Callable[[int], float] | None = None,
+) -> None:
+    alert_key = _sender_fallback_alert_key(entity)
+    alerted = getattr(sender_client, "_tgwatch_sender_fallback_alert_sent", None)
+    if not isinstance(alerted, set):
+        alerted = set()
+        setattr(sender_client, "_tgwatch_sender_fallback_alert_sent", alerted)
+    if alert_key in alerted:
+        return
+    try:
+        await _send_with_backoff(
+            fallback_client,
+            entity,
+            _SENDER_FALLBACK_ALERT,
+            on_flood_wait=on_flood_wait,
+        )
+        alerted.add(alert_key)
+    except Exception as alert_exc:
+        logger.warning("Failed to send sender fallback alert: %s", alert_exc)
+
+
+def _sender_fallback_alert_key(entity: int | str) -> str:
+    return f"{type(entity).__name__}:{entity}"
 
 
 async def _resolve_entity(
