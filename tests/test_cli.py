@@ -18,6 +18,7 @@ from telegram_watch.cli import (
     _run_archive_context_command,
     _run_archive_qa_init_command,
     _run_archive_repair_command,
+    _run_archive_senders_backfill_command,
     _run_archive_status_command,
     _run_list_topics_command,
     build_parser,
@@ -71,6 +72,34 @@ def test_archive_backfill_help_explains_zero_limit_noop(capsys) -> None:
     assert "--limit" in output
     assert "Non-negative maximum messages" in output
     assert "0 is a no-op" in output
+    assert "does not connect to Telegram" in output
+
+
+def test_archive_senders_backfill_parser_defaults_to_dry_run() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        ["archive-senders-backfill", "--config", "config.toml"]
+    )
+
+    assert args.command == "archive-senders-backfill"
+    assert args.limit is None
+    assert args.apply is False
+    assert args.dry_run is False
+
+
+def test_archive_senders_backfill_help_explains_distinct_sender_limit(capsys) -> None:
+    parser = build_parser()
+    try:
+        parser.parse_args(["archive-senders-backfill", "--help"])
+    except SystemExit as exc:
+        assert exc.code == 0
+    else:
+        raise AssertionError("archive-senders-backfill --help should exit")
+
+    output = capsys.readouterr().out
+    assert "distinct senders" in output
+    assert "0 is" in output
+    assert "a no-op" in output
     assert "does not connect to Telegram" in output
 
 
@@ -360,6 +389,67 @@ def test_format_context_row_ignores_archive_reply_snapshot() -> None:
 
     assert "  Text: archive row" in formatted
     assert "Reply snapshot:" not in formatted
+
+
+def test_format_context_row_prefers_alias_and_never_prints_raw_sender_id() -> None:
+    sender_id = 987654321
+    row = cli_module.ArchiveContextMessage(
+        chat_id=-1001,
+        message_id=1,
+        topic_id=None,
+        sender_id=sender_id,
+        date=datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc),
+        text="archive row",
+        effective_text="archive row",
+        payload_mode="archive",
+        tracked_text=None,
+        tracked_replied_text=None,
+        tracked_row_found=False,
+        tracked_db_matches_current=True,
+        tracked_message_chat_id=None,
+        tracked_message_id=None,
+        sender=archive_storage.ArchiveSender(
+            sender_id=sender_id,
+            username="archive_user",
+            display_name="Archive User",
+            first_seen_at=datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc),
+            last_seen_at=datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc),
+        ),
+    )
+
+    alias_output = cli_module._format_context_row(row, sender_alias="Core Tracker")
+    snapshot_output = cli_module._format_context_row(row)
+
+    assert "Core Tracker" in alias_output
+    assert "Archive User (@archive_user)" not in alias_output
+    assert "Archive User (@archive_user)" in snapshot_output
+    assert str(sender_id) not in alias_output
+    assert str(sender_id) not in snapshot_output
+
+
+def test_format_context_row_uses_anonymous_label_without_sender_snapshot() -> None:
+    sender_id = 987654321
+    row = cli_module.ArchiveContextMessage(
+        chat_id=-1001,
+        message_id=1,
+        topic_id=None,
+        sender_id=sender_id,
+        date=datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc),
+        text="archive row",
+        effective_text="archive row",
+        payload_mode="archive",
+        tracked_text=None,
+        tracked_replied_text=None,
+        tracked_row_found=False,
+        tracked_db_matches_current=True,
+        tracked_message_chat_id=None,
+        tracked_message_id=None,
+    )
+
+    output = cli_module._format_context_row(row)
+
+    assert "Anonymous sender" in output
+    assert str(sender_id) not in output
 
 
 def test_archive_status_disabled_does_not_create_archive_root(tmp_path) -> None:
@@ -1009,6 +1099,74 @@ def test_archive_backfill_zero_limit_does_not_create_archive_root(tmp_path) -> N
 
     assert asyncio.run(_run_archive_backfill_command(config, limit=None, apply=False)) == 0
     assert not config.full_archive.root_dir.exists()
+
+
+def test_archive_senders_backfill_prints_aggregate_results_only(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+        config_version = 1.0
+
+        [telegram]
+        api_id = 42
+        api_hash = "abcdefghijk"
+
+        [target]
+        target_chat_id = -1001
+        tracked_user_ids = [123]
+
+        [control]
+        control_chat_id = -1002
+
+        [storage]
+        db_path = "data/app.sqlite3"
+        media_dir = "data/media"
+
+        [full_archive]
+        enabled = true
+        source_chat_id = -1001
+        root_dir = "data/full_archive"
+        """,
+        encoding="utf-8",
+    )
+    config = load_config(config_path)
+
+    async def fake_backfill(_config, *, limit=None, apply=False):
+        assert limit == 10
+        assert apply is False
+        return SimpleNamespace(
+            candidates=7,
+            reused=1,
+            cached=3,
+            fetched=2,
+            unresolved=1,
+            written_senders=6,
+            shard_writes=8,
+            dry_run=True,
+        )
+
+    monkeypatch.setattr(cli_module, "run_archive_senders_backfill", fake_backfill)
+
+    result = asyncio.run(
+        _run_archive_senders_backfill_command(
+            config,
+            limit=10,
+            apply=False,
+        )
+    )
+
+    assert result == 0
+    output = capsys.readouterr().out
+    assert "Missing sender snapshots: 7" in output
+    assert "Resolved from session cache: 3" in output
+    assert "Resolved from Telegram history: 2" in output
+    assert "Unresolved senders: 1" in output
+    assert "Dry-run only" in output
+    assert "sender_id" not in output
 
 
 def test_archive_backfill_prints_updated_rows(monkeypatch, tmp_path, capsys) -> None:

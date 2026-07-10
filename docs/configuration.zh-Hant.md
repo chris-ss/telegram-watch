@@ -197,6 +197,8 @@ L7 | **啟動預熱** — 啟動後前幾分鐘限制發送速率，防止積壓
 
 全量歸檔是可選的本機上下文層，預設關閉。啟用後，tgwatch 會把指定來源群組或指定 forum Topic 靜默寫入 `root_dir` 下獨立的 SQLite manifest 與分片；既有 tracked-user 推播與報告仍繼續使用原 tracked DB。
 
+即時歸檔也會保存本機 sender 顯示快照（`display_name`、`username`、首次/最後出現時間）。這份 metadata 與訊息 payload 分離，因此 tracked 訊息仍只保存 `tracked_ref`，不會在全量歸檔內重複保存本文或媒體 metadata。
+
 欄位 | 說明 | 預設值
 ----- | ---- | ------
 `enabled` | 啟用歸檔寫入與 `archive-backfill --apply` 寫入。 | `false`
@@ -224,9 +226,12 @@ python -m tgwatch archive-repair --config config.toml --prune-missing-shards --a
 python -m tgwatch archive-context --config config.toml --chat -1001234567890 --message-id 12345
 python -m tgwatch archive-backfill --config config.toml --limit 100 --dry-run
 python -m tgwatch archive-backfill --config config.toml --limit 100 --apply
+python -m tgwatch archive-senders-backfill --config config.toml --dry-run
+python -m tgwatch archive-senders-backfill --config config.toml --apply
 ```
 
 `archive-backfill` 預設 dry-run，只有傳 `--apply` 才寫入歸檔。`--limit 0` 是成功 no-op，不連接 Telegram。
+`archive-senders-backfill` 預設只在本機 dry-run，統計缺少可用快照的 distinct sender。傳入 `--apply` 後，每個 sender 只解析一次：優先讀取 Telethon session entity cache，未命中時選一則已歸檔 Telegram 訊息查詢並自動處理 FloodWait，最後把快照寫入所有引用該 sender 的分片。此指令使用 primary session，執行 `--apply` 前應先停止 watcher daemon。顯示優先順序為已設定的 tracked-user alias、顯示名稱加 `@username`、匿名標籤；歸檔輸出不會回退到原始 sender ID。
 `list-topics` 會把普通 Topic 標為可用於 `topic_ids`，把 General (`1`) 標為 `whole_group`，不要把 `1` 填進 `full_archive.topic_ids`。
 `archive-qa-init` 會在 `reports/full_archive_qa/` 下建立帶脫敏提示的真實 Telegram QA 草稿；`reports/` 已在 `.gitignore` 中排除。
 `archive-status` 是唯讀命令；full archive 關閉時只顯示 disabled，不能建立歸檔檔案。

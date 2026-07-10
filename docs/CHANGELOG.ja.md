@@ -8,6 +8,7 @@
 - 任意の全量メッセージアーカイブ保存を追加。telegram-watch は既存の追跡ユーザー通知とレポートを変更せず、別個の SQLite manifest/shard 構成にグループ全体または指定 Topic のローカル文脈コピーを保存できます。
 - 全量アーカイブ内の tracked メッセージは `tracked_ref` で既存 tracked データベースへ接続し、追跡メッセージ本文とメディア metadata の重複保存を避けながら、後続の `archive-context` クエリに必要なタイムライン文脈を保持します。
 - 全量アーカイブ運用コマンドとして `archive-backfill`、`archive-status`、`archive-repair`、`archive-context`、`list-topics`、`archive-qa-init` を追加。デフォルト無効の設定、劣化状態の起動ゲート、修復診断、gitignored の実 Telegram QA 証跡テンプレートを含みます。
+- 全量アーカイブの live 書き込み時にローカル sender 表示スナップショットを保存し、既存シャードを補完する `archive-senders-backfill` を追加しました。各 sender は Telethon session cache を優先して解決し、見つからない場合のみ FloodWait を処理しながら Telegram 履歴を参照します。アーカイブ側の表示は設定済み alias、表示名/username の順で優先し、raw sender ID は公開しません。
 - 送信アカウントが一時的に切断された場合、primary アカウントへフォールバックする前に設定済み sender を再接続して sender で再送を試み、最終的に primary フォールバックを使う場合はコントロールチャットへ警告を投稿するようにしました。daemon の長時間実行中にブリッジメッセージが静かに primary 送信へ切り替わり続ける問題を防ぎます。
 - 検証済みの Telethon 1.44.0 parser で Telegram の `message#3ae56482` 応答に対応し、既存 session を削除せずに launcher が古い Telethon 環境を更新できるようにします。
 

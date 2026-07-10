@@ -202,6 +202,8 @@ You may leave the defaults or point them to any writable path. The `doctor` comm
 
 Full archive is an optional local context layer. It is disabled by default. When enabled, tgwatch silently records the selected source group or selected forum Topics into separate SQLite shards under `root_dir`; existing tracked-user pushes and reports continue to use the normal tracked DB.
 
+Live archive capture also stores a local sender display snapshot (`display_name`, `username`, and first/last seen timestamps). This metadata is independent from message payload storage, so tracked messages remain `tracked_ref` rows and do not duplicate their text or media metadata in the full archive.
+
 Field | Description | Default
 ----- | ----------- | -------
 `enabled` | Enable the archive writer and `archive-backfill` writes. | `false`
@@ -229,9 +231,12 @@ python -m tgwatch archive-repair --config config.toml --prune-missing-shards --a
 python -m tgwatch archive-context --config config.toml --chat -1001234567890 --message-id 12345
 python -m tgwatch archive-backfill --config config.toml --limit 100 --dry-run
 python -m tgwatch archive-backfill --config config.toml --limit 100 --apply
+python -m tgwatch archive-senders-backfill --config config.toml --dry-run
+python -m tgwatch archive-senders-backfill --config config.toml --apply
 ```
 
 `archive-backfill` defaults to dry-run. It writes archive rows only when `--apply` is provided. A limit of `0` is a successful no-op and does not connect to Telegram.
+`archive-senders-backfill` defaults to a local dry-run that counts distinct senders missing usable snapshots. With `--apply`, it resolves each sender once, preferring the Telethon session entity cache and falling back to one archived Telegram message with FloodWait retry, then writes the snapshot to every shard that references that sender. Stop the watcher daemon before `--apply` because the command uses the primary session. A configured tracked-user alias has display priority, followed by display name plus `@username`, then an anonymous label; archive output never falls back to the raw sender ID.
 `list-topics` marks normal forum Topics as usable in `topic_ids` and marks General (`1`) as `whole_group`, so do not copy `1` into `full_archive.topic_ids`.
 `archive-qa-init` creates a redaction-aware real Telegram QA draft under `reports/full_archive_qa/`, which is gitignored.
 `archive-status` is read-only; when full archive is disabled it reports disabled and must not create archive files.

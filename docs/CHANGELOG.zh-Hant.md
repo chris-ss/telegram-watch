@@ -8,6 +8,7 @@
 - 新增可選的全量訊息歸檔儲存：telegram-watch 現在可以在獨立的 SQLite manifest/shard 體系中保存整個群組或指定 Topic 的本機上下文副本，同時保持既有 tracked-user 通知與報告邏輯不變。
 - 全量歸檔中的 tracked 訊息會透過 `tracked_ref` 連回現有 tracked 資料庫，避免重複保存被追蹤訊息本文和媒體 metadata，同時保留足夠時間線資訊供後續 `archive-context` 查詢使用。
 - 新增全量歸檔維運指令：`archive-backfill`、`archive-status`、`archive-repair`、`archive-context`、`list-topics`、`archive-qa-init`，並提供預設關閉設定、降級狀態啟動攔截、修復診斷，以及 gitignored 的真實 Telegram QA 證據範本。
+- 即時寫入全量歸檔時保存本機 sender 顯示快照，並新增 `archive-senders-backfill` 補齊既有分片；每個 sender 優先從 Telethon session cache 解析，未命中時再查詢 Telegram 歷史並處理 FloodWait。歸檔端顯示優先使用設定別名，其次使用顯示名稱/username，且不會暴露原始 sender ID。
 - 發送端帳號暫時斷線時，會先重新連接已設定的 sender 並用 sender 重試；若最後仍需回退到主帳號，會向控制群發送可見告警，避免 daemon 長時間執行後橋接訊息靜默改由主帳號發送。
 - 使用經過驗證的 Telethon 1.44.0 parser 相容 Telegram 的 `message#3ae56482` 回應，並讓既有啟動環境自動更新過期的 Telethon，同時保留現有 session。
 

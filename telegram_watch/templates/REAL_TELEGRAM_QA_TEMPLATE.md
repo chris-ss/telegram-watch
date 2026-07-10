@@ -169,6 +169,27 @@ python -m tgwatch archive-status --config config.toml
 - 触发 FloodWait 时可恢复并降速：
 - `archive-context` 能围绕历史 tracked message 读出 backfill 上下文：
 
+## Sender 显示快照
+
+执行 `--apply` 前先停止 watcher daemon，避免 primary session 被两个进程同时使用。
+
+```bash
+python -m tgwatch archive-senders-backfill --config config.toml --dry-run
+python -m tgwatch archive-senders-backfill --config config.toml --limit 20 --apply
+python -m tgwatch archive-senders-backfill --config config.toml --limit 20 --dry-run
+python -m tgwatch archive-context --config config.toml --chat <target_chat_id> --message-id <tracked_message_id> --before-minutes 10 --after-minutes 5
+```
+
+通过条件：
+
+- 第一次 dry-run 只统计缺少快照的 distinct sender，不连接 Telegram、不写 shard：
+- apply 输出区分 session cache、Telegram history、unresolved 和 shard writes，且日志/证据不包含 raw sender ID：
+- 同一 sender 在一次 apply 中最多查询一次；触发 FloodWait 时自动等待并继续：
+- 第二次 dry-run 的缺失数量按成功写入数下降；unresolved sender 不阻塞其他 sender：
+- daemon 重启后，新的普通消息会自动写入 `archive_senders`，同一 sender 后续消息只扩展 first/last seen 时间：
+- tracked message 仍是 `tracked_ref`，无重复正文/媒体 metadata，同时对应 sender snapshot 可用：
+- `archive-context` 对 tracked 用户优先显示配置 alias，对其他成员显示 display name / `@username`，无法解析时显示匿名标签，任何情况都不显示 raw sender ID：
+
 ## 数据库可管理性
 
 - 删除整个 `full_archive.root_dir` 后 tracked DB 是否仍可用：

@@ -8,6 +8,7 @@
 - Add optional full-message archive storage: telegram-watch can now keep a local whole-group or selected-Topic context copy in a separate SQLite manifest/shard set while leaving tracked-user notifications and reports unchanged.
 - Link full-archive rows back to the existing tracked database with `tracked_ref` records, avoiding duplicate tracked message text/media metadata while preserving enough timeline context for later `archive-context` queries.
 - Add the full-archive operational surface: `archive-backfill`, `archive-status`, `archive-repair`, `archive-context`, `list-topics`, and `archive-qa-init`, with default-off config, degraded-state startup gating, repair diagnostics, and a gitignored real Telegram QA evidence template.
+- Capture local sender display snapshots during live full-archive writes and add `archive-senders-backfill` for existing shards, resolving each sender from the Telethon session cache before Telegram history with FloodWait handling. Archive-facing labels prefer configured aliases, then display name/username, and never expose raw sender IDs.
 - Reconnect the configured sender account before falling back to the primary account, and post a control-chat warning if primary fallback is used, so a temporary sender disconnect does not silently switch bridge messages to the primary account for the rest of the daemon run.
 - Restore compatibility with Telegram's `message#3ae56482` response schema using the tested Telethon 1.44.0 parser, and make existing launcher environments refresh stale Telethon installs without deleting sessions.
 
