@@ -15,7 +15,7 @@ from html import escape
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Sequence, TypeVar
 
-from telethon import TelegramClient, events, errors, functions
+from telethon import TelegramClient, events, errors, functions, utils
 from telethon.sessions import SQLiteSession
 from telethon.tl.custom import message as custom_message
 
@@ -28,12 +28,18 @@ from .config import (
 from .full_archive_storage import (
     ArchiveMedia,
     ArchiveMessage,
+    ArchiveSender,
+    ArchiveSenderCandidate,
     archive_message_exists,
     connect as archive_connect,
+    ensure_archive_sender_schema,
     find_shard_for_message,
     inspect_archive_status,
+    list_archive_sender_candidates,
+    only_archive_sender_schema_missing,
     persist_archive_message,
     persist_archive_message_with_result,
+    persist_archive_sender_to_shards,
     record_tracked_db_link,
     record_shard_write,
     select_shard,
@@ -67,6 +73,7 @@ _SENDER_FALLBACK_ALERT = (
 ARCHIVE_BACKFILL_WAIT_THRESHOLD = 1_000
 ARCHIVE_BACKFILL_WAIT_TIME_SECONDS = 1.0
 ARCHIVE_RELINK_SHUTDOWN_TIMEOUT_SECONDS = 5.0
+ARCHIVE_SENDER_LOOKUP_RETRY_SECONDS = 60.0
 
 
 @dataclass
@@ -91,6 +98,25 @@ class ArchiveBackfillStats:
     linked: int = 0
     updated: int = 0
     dry_run: bool = True
+
+
+@dataclass
+class ArchiveSenderBackfillStats:
+    candidates: int = 0
+    schema_updates: int = 0
+    reused: int = 0
+    cached: int = 0
+    fetched: int = 0
+    unresolved: int = 0
+    written_senders: int = 0
+    shard_writes: int = 0
+    dry_run: bool = True
+
+
+@dataclass(frozen=True)
+class _ArchiveSenderIdentity:
+    username: str | None
+    display_name: str | None
 
 
 @dataclass(frozen=True)
@@ -176,6 +202,25 @@ class _WalSqliteSession(SQLiteSession):
             self._conn.execute("PRAGMA busy_timeout = 5000")
             self._wal_set = True
         return c
+
+    def get_cached_sender_identity(
+        self,
+        sender_id: int,
+    ) -> _ArchiveSenderIdentity | None:
+        row = self._execute(
+            "SELECT username, name FROM entities WHERE id = ?",
+            sender_id,
+        )
+        if row is None:
+            return None
+        username = _normalize_sender_username(row[0])
+        display_name = _normalize_sender_text(row[1])
+        if not username and not display_name:
+            return None
+        return _ArchiveSenderIdentity(
+            username=username,
+            display_name=display_name,
+        )
 
 
 def _resolve_once_targets(config: Config, selector: str | None) -> tuple[TargetGroupConfig, ...]:
@@ -434,6 +479,121 @@ async def run_archive_backfill(
     finally:
         await client.disconnect()
     return stats
+
+
+async def run_archive_senders_backfill(
+    config: Config,
+    *,
+    limit: int | None = None,
+    apply: bool = False,
+) -> ArchiveSenderBackfillStats:
+    """Resolve missing full-archive sender snapshots without exposing IDs."""
+    archive = config.full_archive
+    if not archive.enabled or archive.source_chat_id is None:
+        raise ValueError(
+            "full_archive must be enabled before running archive-senders-backfill"
+        )
+    if limit is not None and limit < 0:
+        raise ValueError("archive-senders-backfill limit must be >= 0")
+    if limit == 0:
+        return ArchiveSenderBackfillStats(dry_run=not apply)
+
+    schema_updates = 0
+    if apply:
+        schema_updates = await asyncio.to_thread(
+            ensure_archive_sender_schema,
+            archive.root_dir,
+        )
+    candidates = list_archive_sender_candidates(archive.root_dir, limit=limit)
+    stats = ArchiveSenderBackfillStats(
+        candidates=len(candidates),
+        schema_updates=schema_updates,
+        dry_run=not apply,
+    )
+    if not apply or not candidates:
+        return stats
+
+    unresolved_candidates: list[ArchiveSenderCandidate] = []
+    for candidate in candidates:
+        if candidate.existing_sender is None:
+            unresolved_candidates.append(candidate)
+            continue
+        stats.reused += 1
+        stats.shard_writes += await asyncio.to_thread(
+            persist_archive_sender_to_shards,
+            candidate.existing_sender,
+            candidate.shard_paths,
+        )
+        stats.written_senders += 1
+    if not unresolved_candidates:
+        return stats
+
+    client = _build_client(config)
+    await _start_client(client, "primary")
+    try:
+        cached_lookup = getattr(client.session, "get_cached_sender_identity", None)
+        for candidate in unresolved_candidates:
+            identity = (
+                cached_lookup(candidate.sender_id)
+                if callable(cached_lookup)
+                else None
+            )
+            if identity is not None:
+                stats.cached += 1
+            else:
+                identity = await _fetch_archive_sender_identity(client, candidate)
+                if identity is not None:
+                    stats.fetched += 1
+            if identity is None:
+                stats.unresolved += 1
+                continue
+            snapshot = _archive_sender_from_identity(candidate, identity)
+
+            stats.shard_writes += await asyncio.to_thread(
+                persist_archive_sender_to_shards,
+                snapshot,
+                candidate.shard_paths,
+            )
+            stats.written_senders += 1
+    finally:
+        await client.disconnect()
+    return stats
+
+
+async def _fetch_archive_sender_identity(
+    client: TelegramClient,
+    candidate: ArchiveSenderCandidate,
+) -> _ArchiveSenderIdentity | None:
+    try:
+        message = await _with_floodwait(
+            client.get_messages,
+            candidate.chat_id,
+            ids=candidate.message_id,
+        )
+        if isinstance(message, (list, tuple)):
+            message = message[0] if message else None
+        if message is None:
+            return None
+        get_sender = getattr(message, "get_sender", None)
+        if not callable(get_sender):
+            return _sender_identity_from_entity(getattr(message, "sender", None))
+        entity = await _with_floodwait(get_sender)
+        return _sender_identity_from_entity(entity)
+    except (errors.RPCError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def _archive_sender_from_identity(
+    candidate: ArchiveSenderCandidate,
+    identity: _ArchiveSenderIdentity,
+) -> ArchiveSender:
+    return ArchiveSender(
+        sender_id=candidate.sender_id,
+        username=identity.username,
+        display_name=identity.display_name,
+        first_seen_at=candidate.first_seen_at,
+        last_seen_at=candidate.last_seen_at,
+    )
 
 
 async def run_list_topics(
@@ -741,6 +901,21 @@ def _full_archive_runtime_enabled(config: Config) -> bool:
         archive.root_dir,
         tracked_db_path=config.storage.db_path,
     )
+    if only_archive_sender_schema_missing(report):
+        try:
+            updated = ensure_archive_sender_schema(archive.root_dir)
+        except (OSError, sqlite3.Error) as exc:
+            logger.warning("Failed to migrate full archive sender schema: %s", exc)
+        else:
+            if updated:
+                logger.info(
+                    "Added archive_senders table to %s existing full archive shard(s)",
+                    updated,
+                )
+            report = inspect_archive_status(
+                archive.root_dir,
+                tracked_db_path=config.storage.db_path,
+            )
     if not report.degraded:
         return True
     logger.warning(
@@ -1054,6 +1229,12 @@ class _TargetHandler:
 class _FullArchiveHandler:
     def __init__(self, config: Config):
         self.config = config
+        self._sender_identity_cache: dict[int, _ArchiveSenderIdentity] = {}
+        self._sender_lookup_retry_after: dict[int, float] = {}
+        self._sender_lookup_tasks: dict[
+            int,
+            asyncio.Task[_ArchiveSenderIdentity | None],
+        ] = {}
 
     async def handle(self, event: events.NewMessage.Event) -> None:
         try:
@@ -1066,11 +1247,13 @@ class _FullArchiveHandler:
                 message,
             ):
                 return
+            sender_snapshot = await self._sender_snapshot(event, message)
             await asyncio.to_thread(
                 _persist_archive_message_to_storage,
                 self.config,
                 message,
                 tracked_db_path=self.config.storage.db_path,
+                sender_snapshot=sender_snapshot,
             )
         except Exception as exc:
             logger.warning(
@@ -1078,6 +1261,83 @@ class _FullArchiveHandler:
                 exc,
                 exc_info=True,
             )
+
+    async def _sender_snapshot(
+        self,
+        event: events.NewMessage.Event,
+        message: ArchiveMessage,
+    ) -> ArchiveSender | None:
+        if message.sender_id is None:
+            return None
+        identity = await self._sender_identity(event, message.sender_id)
+        if identity is None:
+            return None
+        return ArchiveSender(
+            sender_id=message.sender_id,
+            username=identity.username,
+            display_name=identity.display_name,
+            first_seen_at=message.date,
+            last_seen_at=message.date,
+        )
+
+    async def _sender_identity(
+        self,
+        event: events.NewMessage.Event,
+        sender_id: int,
+    ) -> _ArchiveSenderIdentity | None:
+        if sender_id in self._sender_identity_cache:
+            return self._sender_identity_cache[sender_id]
+        loop = asyncio.get_running_loop()
+        retry_after = self._sender_lookup_retry_after.get(sender_id)
+        if retry_after is not None and loop.time() < retry_after:
+            return None
+        task = self._sender_lookup_tasks.get(sender_id)
+        if task is None:
+            task = asyncio.create_task(self._load_sender_identity(event))
+            self._sender_lookup_tasks[sender_id] = task
+        try:
+            identity = await task
+        except errors.FloodWaitError as exc:
+            wait_for = max(
+                ARCHIVE_SENDER_LOOKUP_RETRY_SECONDS,
+                float(exc.seconds + 1),
+            )
+            self._sender_lookup_retry_after[sender_id] = loop.time() + wait_for
+            logger.warning(
+                "FloodWait during full archive sender lookup; retrying after %ss",
+                wait_for,
+            )
+            return None
+        finally:
+            self._sender_lookup_tasks.pop(sender_id, None)
+        if identity is None:
+            self._sender_lookup_retry_after[sender_id] = (
+                loop.time() + ARCHIVE_SENDER_LOOKUP_RETRY_SECONDS
+            )
+            return None
+        self._sender_lookup_retry_after.pop(sender_id, None)
+        self._sender_identity_cache[sender_id] = identity
+        return identity
+
+    async def _load_sender_identity(
+        self,
+        event: events.NewMessage.Event,
+    ) -> _ArchiveSenderIdentity | None:
+        get_sender = getattr(event, "get_sender", None)
+        if not callable(get_sender):
+            get_sender = getattr(event.message, "get_sender", None)
+        try:
+            if callable(get_sender):
+                entity = get_sender()
+                if hasattr(entity, "__await__"):
+                    entity = await entity
+            else:
+                entity = getattr(event.message, "sender", None)
+            return _sender_identity_from_entity(entity)
+        except errors.FloodWaitError:
+            raise
+        except Exception:
+            return None
 
 
 def _schedule_archive_relink_after_tracked_persist(
@@ -1215,6 +1475,7 @@ def _persist_archive_message_to_storage(
     message: ArchiveMessage,
     *,
     tracked_db_path: Path | None,
+    sender_snapshot: ArchiveSender | None = None,
 ) -> ArchivePersistResult:
     archive = config.full_archive
     manifest_path = archive.root_dir / "manifest.sqlite3"
@@ -1249,6 +1510,7 @@ def _persist_archive_message_to_storage(
                 message,
                 tracked_db_path=tracked_db_path,
                 archive_root_dir=archive.root_dir,
+                sender=sender_snapshot,
             )
             payload_mode = persist_result.payload_mode
         finally:
@@ -1331,6 +1593,34 @@ def _coerce_optional_int(value: object) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _sender_identity_from_entity(entity: object) -> _ArchiveSenderIdentity | None:
+    if entity is None:
+        return None
+    username = _normalize_sender_username(getattr(entity, "username", None))
+    display_name = _normalize_sender_text(utils.get_display_name(entity))
+    if not username and not display_name:
+        return None
+    return _ArchiveSenderIdentity(
+        username=username,
+        display_name=display_name,
+    )
+
+
+def _normalize_sender_text(value: object) -> str | None:
+    if value is None:
+        return None
+    normalized = " ".join(str(value).split())
+    return normalized or None
+
+
+def _normalize_sender_username(value: object) -> str | None:
+    normalized = _normalize_sender_text(value)
+    if normalized is None:
+        return None
+    normalized = normalized.lstrip("@").strip()
+    return normalized or None
 
 
 def _coerce_optional_datetime(value: object) -> datetime | None:

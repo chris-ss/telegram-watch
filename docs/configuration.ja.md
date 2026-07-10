@@ -197,6 +197,8 @@ L7 | **起動ウォームアップ** — 起動後数分間は送信レートを
 
 全量アーカイブは任意のローカル文脈レイヤーで、既定では無効です。有効にすると、tgwatch は指定したソースグループまたは指定した forum Topic を `root_dir` 配下の独立した SQLite manifest とシャードへ静かに記録します。既存の tracked-user 通知とレポートは引き続き通常の tracked DB を使用します。
 
+live アーカイブはローカル sender 表示スナップショット（`display_name`、`username`、初回/最終出現時刻）も保存します。この metadata はメッセージ payload と独立しているため、tracked メッセージは引き続き `tracked_ref` のみを保存し、全量アーカイブ側に本文やメディア metadata を重複保存しません。daemon 起動時、旧 shard の唯一の health issue が additive `archive_senders` テーブルの欠落である場合は live-capture health gate の前に自動移行し、それ以外の degraded 状態では引き続き live アーカイブ書き込みを無効化します。
+
 項目 | 説明 | 既定値
 ----- | ---- | ------
 `enabled` | アーカイブ writer と `archive-backfill --apply` の書き込みを有効化します。 | `false`
@@ -224,9 +226,12 @@ python -m tgwatch archive-repair --config config.toml --prune-missing-shards --a
 python -m tgwatch archive-context --config config.toml --chat -1001234567890 --message-id 12345
 python -m tgwatch archive-backfill --config config.toml --limit 100 --dry-run
 python -m tgwatch archive-backfill --config config.toml --limit 100 --apply
+python -m tgwatch archive-senders-backfill --config config.toml --dry-run
+python -m tgwatch archive-senders-backfill --config config.toml --apply
 ```
 
 `archive-backfill` は既定で dry-run です。`--apply` を付けた場合のみアーカイブ行を書き込みます。`--limit 0` は成功する no-op で、Telegram に接続しません。
+`archive-senders-backfill` は既定ではローカル dry-run として、利用可能なスナップショットがない distinct sender 数を集計します。`--apply` では、旧シャードの唯一の health issue が additive `archive_senders` テーブルの欠落である場合に先に自動作成し、それ以外の degraded 状態は引き続き拒否します。その後 sender ごとに一度だけ解決し、Telethon session entity cache を優先し、見つからない場合はアーカイブ済み Telegram メッセージを 1 件参照して FloodWait を自動処理した後、その sender を参照する全シャードへスナップショットを書き込みます。このコマンドは primary session を使うため、`--apply` の前に watcher daemon を停止してください。表示優先度は設定済み tracked-user alias、表示名と `@username`、匿名ラベルの順で、アーカイブ出力は raw sender ID にフォールバックしません。
 `list-topics` は通常 Topic を `topic_ids` に使えるものとして表示し、General (`1`) は `whole_group` として表示します。`1` を `full_archive.topic_ids` に入れないでください。
 `archive-qa-init` は `reports/full_archive_qa/` 配下に、伏せ字を前提にした実 Telegram QA 下書きを作成します。`reports/` は `.gitignore` で除外されています。
 `archive-status` は読み取り専用コマンドです。full archive が無効な場合は disabled を表示するだけで、アーカイブファイルを作成してはいけません。

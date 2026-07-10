@@ -12,6 +12,7 @@ from types import MappingProxyType, SimpleNamespace
 
 import pytest
 from telethon import errors
+from telethon.tl import types as tl_types
 
 from telegram_watch import runner
 from telegram_watch.config import (
@@ -640,6 +641,249 @@ async def test_full_archive_handler_captures_non_tracked_message(tmp_path: Path)
 
     assert row == (999, "non tracked context", "archive")
     assert tracked_db_link_count == 1
+
+
+@pytest.mark.asyncio
+async def test_full_archive_handler_caches_and_updates_sender_snapshot(tmp_path: Path):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    handler = runner._FullArchiveHandler(config)
+    sender_calls = 0
+
+    async def get_sender():
+        nonlocal sender_calls
+        sender_calls += 1
+        return tl_types.User(
+            id=999,
+            first_name="Alice",
+            last_name="Example",
+            username="alice",
+        )
+
+    for message_id in (1, 2):
+        await handler.handle(
+            SimpleNamespace(
+                message=make_archive_event_message(
+                    message_id=message_id,
+                    sender_id=999,
+                ),
+                get_sender=get_sender,
+            )
+        )
+
+    shard_path = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-05.sqlite3"
+    )
+    conn = sqlite3.connect(shard_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT username, display_name, first_seen_at, last_seen_at
+            FROM archive_senders
+            WHERE sender_id = ?
+            """,
+            (999,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert sender_calls == 1
+    assert row == (
+        "alice",
+        "Alice Example",
+        "2026-05-01T12:01:00+00:00",
+        "2026-05-01T12:02:00+00:00",
+    )
+
+
+@pytest.mark.asyncio
+async def test_full_archive_handler_keeps_message_when_sender_lookup_fails(
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    handler = runner._FullArchiveHandler(config)
+
+    async def get_sender():
+        raise RuntimeError("sender unavailable")
+
+    await handler.handle(
+        SimpleNamespace(
+            message=make_archive_event_message(sender_id=999),
+            get_sender=get_sender,
+        )
+    )
+
+    shard_path = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-05.sqlite3"
+    )
+    conn = sqlite3.connect(shard_path)
+    try:
+        message_count = conn.execute(
+            "SELECT COUNT(*) FROM archive_messages"
+        ).fetchone()[0]
+        sender_count = conn.execute(
+            "SELECT COUNT(*) FROM archive_senders"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    assert message_count == 1
+    assert sender_count == 0
+
+
+@pytest.mark.asyncio
+async def test_full_archive_handler_retries_sender_after_failure_cooldown(
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    handler = runner._FullArchiveHandler(config)
+    sender_calls = 0
+
+    async def get_sender():
+        nonlocal sender_calls
+        sender_calls += 1
+        if sender_calls == 1:
+            raise RuntimeError("temporary sender lookup failure")
+        return tl_types.User(
+            id=999,
+            first_name="Recovered",
+            last_name="Sender",
+            username="recovered_sender",
+        )
+
+    for message_id in (1, 2):
+        await handler.handle(
+            SimpleNamespace(
+                message=make_archive_event_message(
+                    message_id=message_id,
+                    sender_id=999,
+                ),
+                get_sender=get_sender,
+            )
+        )
+    assert sender_calls == 1
+
+    handler._sender_lookup_retry_after[999] = 0
+    await handler.handle(
+        SimpleNamespace(
+            message=make_archive_event_message(message_id=3, sender_id=999),
+            get_sender=get_sender,
+        )
+    )
+
+    shard_path = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-05.sqlite3"
+    )
+    conn = sqlite3.connect(shard_path)
+    try:
+        message_count = conn.execute(
+            "SELECT COUNT(*) FROM archive_messages"
+        ).fetchone()[0]
+        sender_row = conn.execute(
+            "SELECT username, display_name FROM archive_senders WHERE sender_id = ?",
+            (999,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert sender_calls == 2
+    assert message_count == 3
+    assert sender_row == ("recovered_sender", "Recovered Sender")
+
+
+@pytest.mark.asyncio
+async def test_full_archive_handler_honors_sender_lookup_floodwait(
+    tmp_path: Path,
+    caplog,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    handler = runner._FullArchiveHandler(config)
+    sender_calls = 0
+
+    async def get_sender():
+        nonlocal sender_calls
+        sender_calls += 1
+        raise errors.FloodWaitError(None, 120)
+
+    loop = asyncio.get_running_loop()
+    with caplog.at_level(logging.WARNING):
+        for message_id in (1, 2):
+            await handler.handle(
+                SimpleNamespace(
+                    message=make_archive_event_message(
+                        message_id=message_id,
+                        sender_id=999,
+                    ),
+                    get_sender=get_sender,
+                )
+            )
+
+    retry_delay = handler._sender_lookup_retry_after[999] - loop.time()
+    shard_path = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-05.sqlite3"
+    )
+    conn = sqlite3.connect(shard_path)
+    try:
+        message_count = conn.execute(
+            "SELECT COUNT(*) FROM archive_messages"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    assert sender_calls == 1
+    assert retry_delay > 119
+    assert retry_delay <= 121
+    assert message_count == 2
+    assert "FloodWait during full archive sender lookup" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_full_archive_handler_keeps_message_when_sender_entity_is_invalid(
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    handler = runner._FullArchiveHandler(config)
+
+    async def get_sender():
+        return object()
+
+    await handler.handle(
+        SimpleNamespace(
+            message=make_archive_event_message(sender_id=999),
+            get_sender=get_sender,
+        )
+    )
+
+    shard_path = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-05.sqlite3"
+    )
+    conn = sqlite3.connect(shard_path)
+    try:
+        message_count = conn.execute(
+            "SELECT COUNT(*) FROM archive_messages"
+        ).fetchone()[0]
+        sender_count = conn.execute(
+            "SELECT COUNT(*) FROM archive_senders"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    assert message_count == 1
+    assert sender_count == 0
 
 
 @pytest.mark.asyncio
@@ -1742,6 +1986,57 @@ async def test_run_daemon_registers_full_archive_handler_when_enabled(
     )
 
 
+def test_full_archive_runtime_migrates_sender_only_schema_before_health_gate(
+    tmp_path: Path,
+    caplog,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    tracked = storage.connect(config.storage.db_path)
+    try:
+        storage.ensure_schema(tracked)
+    finally:
+        tracked.close()
+    archive_message = runner._archive_message_from_telegram(
+        make_archive_event_message(sender_id=999)
+    )
+    assert archive_message is not None
+    runner._persist_archive_message_to_storage(
+        config,
+        archive_message,
+        tracked_db_path=config.storage.db_path,
+    )
+    shard_path = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-05.sqlite3"
+    )
+    shard = sqlite3.connect(shard_path)
+    try:
+        shard.execute("DROP TABLE archive_senders")
+        shard.commit()
+    finally:
+        shard.close()
+
+    before = runner.inspect_archive_status(
+        config.full_archive.root_dir,
+        tracked_db_path=config.storage.db_path,
+    )
+    assert before.degraded is True
+    assert runner.only_archive_sender_schema_missing(before) is True
+
+    with caplog.at_level(logging.INFO):
+        enabled = runner._full_archive_runtime_enabled(config)
+
+    after = runner.inspect_archive_status(
+        config.full_archive.root_dir,
+        tracked_db_path=config.storage.db_path,
+    )
+    assert enabled is True
+    assert after.degraded is False
+    assert "Added archive_senders table to 1 existing full archive shard" in caplog.text
+
+
 @pytest.mark.asyncio
 async def test_run_daemon_skips_full_archive_handlers_when_archive_degraded(
     monkeypatch,
@@ -1783,6 +2078,7 @@ async def test_run_daemon_skips_full_archive_handlers_when_archive_degraded(
         "inspect_archive_status",
         lambda *_args, **_kwargs: SimpleNamespace(
             degraded=True,
+            shards=(),
             errors=("hidden shard data",),
         ),
     )
@@ -2851,6 +3147,310 @@ async def test_archive_backfill_apply_after_floodwait_keeps_counts_exact(
 async def test_archive_backfill_requires_full_archive_enabled(tmp_path: Path):
     with pytest.raises(ValueError):
         await runner.run_archive_backfill(build_config(tmp_path), apply=True)
+
+
+@pytest.mark.asyncio
+async def test_archive_senders_backfill_dry_run_does_not_connect_to_telegram(
+    monkeypatch,
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    archive_message = runner._archive_message_from_telegram(
+        make_archive_event_message(sender_id=999)
+    )
+    assert archive_message is not None
+    runner._persist_archive_message_to_storage(
+        config,
+        archive_message,
+        tracked_db_path=config.storage.db_path,
+    )
+    shard_path = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-05.sqlite3"
+    )
+    shard = sqlite3.connect(shard_path)
+    try:
+        shard.execute("DROP TABLE archive_senders")
+        shard.commit()
+    finally:
+        shard.close()
+
+    def fail_build_client(_config):
+        raise AssertionError("dry-run sender backfill must not connect to Telegram")
+
+    monkeypatch.setattr(runner, "_build_client", fail_build_client)
+
+    stats = await runner.run_archive_senders_backfill(config)
+
+    assert stats.candidates == 1
+    assert stats.schema_updates == 0
+    assert stats.written_senders == 0
+    assert stats.dry_run is True
+    shard = sqlite3.connect(shard_path)
+    try:
+        sender_table = shard.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+            ("archive_senders",),
+        ).fetchone()
+    finally:
+        shard.close()
+    assert sender_table is None
+
+
+@pytest.mark.asyncio
+async def test_archive_senders_backfill_zero_limit_is_noop_without_schema_write(
+    monkeypatch,
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    archive_message = runner._archive_message_from_telegram(
+        make_archive_event_message(sender_id=999)
+    )
+    assert archive_message is not None
+    runner._persist_archive_message_to_storage(
+        config,
+        archive_message,
+        tracked_db_path=config.storage.db_path,
+    )
+    shard_path = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-05.sqlite3"
+    )
+    shard = sqlite3.connect(shard_path)
+    try:
+        shard.execute("DROP TABLE archive_senders")
+        shard.commit()
+    finally:
+        shard.close()
+
+    def fail_build_client(_config):
+        raise AssertionError("zero-limit sender backfill must not connect to Telegram")
+
+    monkeypatch.setattr(runner, "_build_client", fail_build_client)
+
+    stats = await runner.run_archive_senders_backfill(config, limit=0, apply=True)
+
+    shard = sqlite3.connect(shard_path)
+    try:
+        sender_table = shard.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+            ("archive_senders",),
+        ).fetchone()
+    finally:
+        shard.close()
+
+    assert stats.candidates == 0
+    assert stats.schema_updates == 0
+    assert stats.written_senders == 0
+    assert stats.dry_run is False
+    assert sender_table is None
+
+
+@pytest.mark.asyncio
+async def test_archive_senders_backfill_reuses_other_shard_without_telegram(
+    monkeypatch,
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    may_message = runner._archive_message_from_telegram(
+        make_archive_event_message(message_id=1, sender_id=999)
+    )
+    june_event_message = make_archive_event_message(message_id=2, sender_id=999)
+    june_event_message.date = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
+    june_message = runner._archive_message_from_telegram(june_event_message)
+    assert may_message is not None
+    assert june_message is not None
+    runner._persist_archive_message_to_storage(
+        config,
+        may_message,
+        tracked_db_path=config.storage.db_path,
+        sender_snapshot=runner.ArchiveSender(
+            sender_id=999,
+            username="existing_user",
+            display_name="Existing User",
+            first_seen_at=may_message.date,
+            last_seen_at=may_message.date,
+        ),
+    )
+    runner._persist_archive_message_to_storage(
+        config,
+        june_message,
+        tracked_db_path=config.storage.db_path,
+    )
+
+    def fail_build_client(_config):
+        raise AssertionError("existing archive snapshot must skip Telegram")
+
+    monkeypatch.setattr(runner, "_build_client", fail_build_client)
+
+    stats = await runner.run_archive_senders_backfill(config, apply=True)
+
+    june_shard = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-06.sqlite3"
+    )
+    conn = sqlite3.connect(june_shard)
+    try:
+        row = conn.execute(
+            "SELECT username, display_name FROM archive_senders WHERE sender_id = ?",
+            (999,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert stats.reused == 1
+    assert stats.cached == 0
+    assert stats.fetched == 0
+    assert stats.written_senders == 1
+    assert stats.shard_writes == 2
+    assert row == ("existing_user", "Existing User")
+
+
+@pytest.mark.asyncio
+async def test_archive_senders_backfill_prefers_session_entity_cache(
+    monkeypatch,
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    archive_message = runner._archive_message_from_telegram(
+        make_archive_event_message(sender_id=999)
+    )
+    assert archive_message is not None
+    runner._persist_archive_message_to_storage(
+        config,
+        archive_message,
+        tracked_db_path=config.storage.db_path,
+    )
+    shard_path = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-05.sqlite3"
+    )
+    shard = sqlite3.connect(shard_path)
+    try:
+        shard.execute("DROP TABLE archive_senders")
+        shard.commit()
+    finally:
+        shard.close()
+
+    class DummySession:
+        def get_cached_sender_identity(self, sender_id):
+            assert sender_id == 999
+            return runner._ArchiveSenderIdentity(
+                username="cached_user",
+                display_name="Cached User",
+            )
+
+    class DummyClient:
+        session = DummySession()
+
+        async def get_messages(self, *_args, **_kwargs):
+            raise AssertionError("session cache hit must skip Telegram history")
+
+        async def disconnect(self):
+            return None
+
+    async def fake_start_client(_client, _role):
+        return None
+
+    monkeypatch.setattr(runner, "_build_client", lambda _config: DummyClient())
+    monkeypatch.setattr(runner, "_start_client", fake_start_client)
+
+    stats = await runner.run_archive_senders_backfill(config, apply=True)
+
+    conn = sqlite3.connect(shard_path)
+    try:
+        row = conn.execute(
+            "SELECT username, display_name FROM archive_senders WHERE sender_id = ?",
+            (999,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert stats.schema_updates == 1
+    assert stats.cached == 1
+    assert stats.fetched == 0
+    assert stats.written_senders == 1
+    assert stats.shard_writes == 1
+    assert row == ("cached_user", "Cached User")
+
+
+@pytest.mark.asyncio
+async def test_archive_senders_backfill_fetches_history_with_floodwait_retry(
+    monkeypatch,
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    archive_message = runner._archive_message_from_telegram(
+        make_archive_event_message(sender_id=999)
+    )
+    assert archive_message is not None
+    runner._persist_archive_message_to_storage(
+        config,
+        archive_message,
+        tracked_db_path=config.storage.db_path,
+    )
+    get_message_calls = 0
+    get_sender_calls = 0
+    sleeps: list[float] = []
+
+    class DummySession:
+        def get_cached_sender_identity(self, sender_id):
+            assert sender_id == 999
+            return None
+
+    class HistoryMessage:
+        async def get_sender(self):
+            nonlocal get_sender_calls
+            get_sender_calls += 1
+            return tl_types.User(
+                id=999,
+                first_name="History",
+                last_name="User",
+                username="history_user",
+            )
+
+    class DummyClient:
+        session = DummySession()
+
+        async def get_messages(self, chat_id, *, ids):
+            nonlocal get_message_calls
+            assert chat_id == config.full_archive.source_chat_id
+            assert ids == archive_message.message_id
+            get_message_calls += 1
+            if get_message_calls == 1:
+                raise errors.FloodWaitError(None, 0)
+            return HistoryMessage()
+
+        async def disconnect(self):
+            return None
+
+    async def fake_start_client(_client, _role):
+        return None
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(runner, "_build_client", lambda _config: DummyClient())
+    monkeypatch.setattr(runner, "_start_client", fake_start_client)
+    monkeypatch.setattr(runner.asyncio, "sleep", fake_sleep)
+
+    stats = await runner.run_archive_senders_backfill(config, apply=True)
+
+    assert get_message_calls == 2
+    assert get_sender_calls == 1
+    assert sleeps == [1]
+    assert stats.cached == 0
+    assert stats.fetched == 1
+    assert stats.unresolved == 0
+    assert stats.written_senders == 1
 
 
 @pytest.mark.asyncio

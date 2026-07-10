@@ -17,7 +17,7 @@ REQUIRED_SHARD_INDEXES = (
 )
 ADDITIVE_MANIFEST_TABLES = ("tracked_db_links",)
 CORE_SHARD_TABLES = ("archive_messages", "archive_tracked_links")
-ADDITIVE_SHARD_TABLES = ("archive_media",)
+ADDITIVE_SHARD_TABLES = ("archive_media", "archive_senders")
 ARCHIVE_CONTEXT_MEDIA_ID_CHUNK_SIZE = 500
 
 
@@ -45,6 +45,26 @@ class ArchiveMedia:
     mime_type: str | None
     file_size: int | None
     file_name: str | None
+
+
+@dataclass(frozen=True)
+class ArchiveSender:
+    sender_id: int
+    username: str | None
+    display_name: str | None
+    first_seen_at: datetime
+    last_seen_at: datetime
+
+
+@dataclass(frozen=True)
+class ArchiveSenderCandidate:
+    sender_id: int
+    chat_id: int
+    message_id: int
+    first_seen_at: datetime
+    last_seen_at: datetime
+    shard_paths: tuple[Path, ...]
+    existing_sender: ArchiveSender | None = None
 
 
 @dataclass(frozen=True)
@@ -102,6 +122,7 @@ class ArchiveContextMessage:
     reply_to_msg_id: int | None = None
     reply_to_top_id: int | None = None
     media: tuple[ArchiveMedia, ...] = ()
+    sender: ArchiveSender | None = None
 
 
 @dataclass(frozen=True)
@@ -183,6 +204,21 @@ class ArchiveRepairReport:
     skipped_shards: int
     skipped_reasons: tuple[str, ...]
     errors: tuple[str, ...]
+
+
+def only_archive_sender_schema_missing(report: ArchiveStatusReport) -> bool:
+    """Return whether the sender table is the archive's only health issue."""
+    expected_errors = tuple(
+        f"{shard.shard_id}: missing schema table(s): archive_senders"
+        for shard in report.shards
+        if shard.missing_schema_tables == ("archive_senders",)
+    )
+    return bool(expected_errors) and bool(
+        report.missing_shard_count == 0
+        and report.missing_index_count == 0
+        and report.missing_schema_table_count == len(expected_errors)
+        and report.errors == expected_errors
+    )
 
 
 def connect(path: Path) -> sqlite3.Connection:
@@ -328,16 +364,25 @@ def ensure_shard_schema(conn: sqlite3.Connection) -> None:
                 ON DELETE CASCADE
         );
 
+        """
+    )
+    ensure_archive_sender_table(conn)
+    ensure_shard_indexes(conn)
+
+
+def ensure_archive_sender_table(conn: sqlite3.Connection) -> None:
+    """Create only the additive sender table without repairing other schema."""
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS archive_senders (
             sender_id INTEGER PRIMARY KEY,
             username TEXT,
             display_name TEXT,
             first_seen_at TEXT NOT NULL,
             last_seen_at TEXT NOT NULL
-        );
+        )
         """
     )
-    ensure_shard_indexes(conn)
 
 
 def ensure_shard_indexes(conn: sqlite3.Connection) -> None:
@@ -359,6 +404,253 @@ def ensure_shard_indexes(conn: sqlite3.Connection) -> None:
             ON archive_tracked_links(tracked_chat_id, tracked_message_id);
         """
     )
+
+
+def persist_archive_sender(
+    conn: sqlite3.Connection,
+    sender: ArchiveSender,
+) -> None:
+    """Upsert a local sender display snapshot without erasing known names."""
+    ensure_shard_schema(conn)
+    with conn:
+        _persist_archive_sender_in_transaction(conn, sender)
+
+
+def fetch_archive_sender(
+    conn: sqlite3.Connection,
+    sender_id: int,
+) -> ArchiveSender | None:
+    """Return a sender snapshot from one shard."""
+    ensure_shard_schema(conn)
+    row = conn.execute(
+        """
+        SELECT sender_id, username, display_name, first_seen_at, last_seen_at
+        FROM archive_senders
+        WHERE sender_id = ?
+        """,
+        (sender_id,),
+    ).fetchone()
+    return _row_to_archive_sender(row) if row is not None else None
+
+
+def format_archive_sender_label(
+    sender: ArchiveSender | None,
+    *,
+    alias: str | None = None,
+    anonymous_label: str = "Anonymous sender",
+) -> str:
+    """Format a sender label without exposing the raw Telegram sender ID."""
+    safe_alias = _normalize_optional_text(alias)
+    if safe_alias:
+        return safe_alias
+    if sender is not None:
+        display_name = _normalize_optional_text(sender.display_name)
+        username = _normalize_username(sender.username)
+        if display_name and username:
+            return f"{display_name} (@{username})"
+        if display_name:
+            return display_name
+        if username:
+            return f"@{username}"
+    return anonymous_label
+
+
+def list_archive_sender_candidates(
+    root_dir: Path,
+    *,
+    limit: int | None = None,
+) -> tuple[ArchiveSenderCandidate, ...]:
+    """List distinct senders that still need a usable snapshot in any shard."""
+    if limit is not None and limit < 0:
+        raise ValueError("archive sender backfill limit must be >= 0")
+    if limit == 0:
+        return ()
+    manifest_path = root_dir / "manifest.sqlite3"
+    if not manifest_path.exists():
+        return ()
+
+    manifest = connect_readonly(manifest_path)
+    try:
+        shard_rows = manifest.execute(
+            "SELECT path FROM archive_shards ORDER BY starts_at ASC, shard_id ASC"
+        ).fetchall()
+    finally:
+        manifest.close()
+
+    aggregate: dict[int, dict[str, object]] = {}
+    for shard_row in shard_rows:
+        shard_path = _resolve_manifest_shard_path(root_dir, shard_row["path"])
+        if not shard_path.exists():
+            continue
+        try:
+            shard = connect_readonly(shard_path)
+        except sqlite3.Error:
+            continue
+        try:
+            if "archive_messages" in _missing_core_shard_tables(shard):
+                continue
+            has_sender_table = _table_exists(shard, "archive_senders")
+            sender_select = (
+                "s.username, s.display_name, s.first_seen_at AS sender_first_seen_at, "
+                "s.last_seen_at AS sender_last_seen_at"
+                if has_sender_table
+                else (
+                    "NULL AS username, NULL AS display_name, "
+                    "NULL AS sender_first_seen_at, NULL AS sender_last_seen_at"
+                )
+            )
+            sender_join = (
+                "LEFT JOIN archive_senders AS s ON s.sender_id = r.sender_id"
+                if has_sender_table
+                else ""
+            )
+            rows = shard.execute(
+                f"""
+                WITH ranked AS (
+                    SELECT sender_id, chat_id, message_id, date,
+                           MIN(date) OVER (PARTITION BY sender_id) AS first_seen_at,
+                           MAX(date) OVER (PARTITION BY sender_id) AS last_seen_at,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY sender_id
+                               ORDER BY date DESC, message_id DESC
+                           ) AS sender_rank
+                    FROM archive_messages
+                    WHERE sender_id IS NOT NULL
+                )
+                SELECT r.sender_id, r.chat_id, r.message_id,
+                       r.first_seen_at, r.last_seen_at, {sender_select}
+                FROM ranked AS r
+                {sender_join}
+                WHERE r.sender_rank = 1
+                """
+            ).fetchall()
+        finally:
+            shard.close()
+
+        for row in rows:
+            sender_id = int(row["sender_id"])
+            first_seen_at = _deserialize_dt(row["first_seen_at"])
+            last_seen_at = _deserialize_dt(row["last_seen_at"])
+            entry = aggregate.get(sender_id)
+            if entry is None:
+                entry = {
+                    "chat_id": int(row["chat_id"]),
+                    "message_id": int(row["message_id"]),
+                    "first_seen_at": first_seen_at,
+                    "last_seen_at": last_seen_at,
+                    "shard_paths": [],
+                    "existing_sender": None,
+                    "all_shards_resolved": True,
+                }
+                aggregate[sender_id] = entry
+            else:
+                entry["first_seen_at"] = min(
+                    entry["first_seen_at"],
+                    first_seen_at,
+                )
+                if last_seen_at > entry["last_seen_at"]:
+                    entry["last_seen_at"] = last_seen_at
+                    entry["chat_id"] = int(row["chat_id"])
+                    entry["message_id"] = int(row["message_id"])
+            entry["shard_paths"].append(shard_path)
+
+            username = _normalize_username(row["username"])
+            display_name = _normalize_optional_text(row["display_name"])
+            if not username and not display_name:
+                entry["all_shards_resolved"] = False
+            elif entry["existing_sender"] is None:
+                snapshot_first = (
+                    _deserialize_dt(row["sender_first_seen_at"])
+                    if row["sender_first_seen_at"] is not None
+                    else first_seen_at
+                )
+                snapshot_last = (
+                    _deserialize_dt(row["sender_last_seen_at"])
+                    if row["sender_last_seen_at"] is not None
+                    else last_seen_at
+                )
+                entry["existing_sender"] = ArchiveSender(
+                    sender_id=sender_id,
+                    username=username,
+                    display_name=display_name,
+                    first_seen_at=snapshot_first,
+                    last_seen_at=snapshot_last,
+                )
+
+    candidates: list[ArchiveSenderCandidate] = []
+    for sender_id, entry in aggregate.items():
+        if entry["all_shards_resolved"]:
+            continue
+        existing = entry["existing_sender"]
+        if existing is not None:
+            existing = ArchiveSender(
+                sender_id=sender_id,
+                username=existing.username,
+                display_name=existing.display_name,
+                first_seen_at=entry["first_seen_at"],
+                last_seen_at=entry["last_seen_at"],
+            )
+        candidates.append(
+            ArchiveSenderCandidate(
+                sender_id=sender_id,
+                chat_id=entry["chat_id"],
+                message_id=entry["message_id"],
+                first_seen_at=entry["first_seen_at"],
+                last_seen_at=entry["last_seen_at"],
+                shard_paths=tuple(dict.fromkeys(entry["shard_paths"])),
+                existing_sender=existing,
+            )
+        )
+    candidates.sort(key=lambda candidate: candidate.sender_id)
+    if limit is not None:
+        candidates = candidates[:limit]
+    return tuple(candidates)
+
+
+def persist_archive_sender_to_shards(
+    sender: ArchiveSender,
+    shard_paths: tuple[Path, ...],
+) -> int:
+    """Persist one resolved sender snapshot to each shard that references it."""
+    written = 0
+    for shard_path in dict.fromkeys(shard_paths):
+        shard = connect(shard_path)
+        try:
+            persist_archive_sender(shard, sender)
+        finally:
+            shard.close()
+        written += 1
+    return written
+
+
+def ensure_archive_sender_schema(root_dir: Path) -> int:
+    """Create the additive sender table in registered shards that lack it."""
+    manifest_path = root_dir / "manifest.sqlite3"
+    if not manifest_path.exists():
+        return 0
+    manifest = connect_readonly(manifest_path)
+    try:
+        rows = manifest.execute(
+            "SELECT path FROM archive_shards ORDER BY starts_at ASC, shard_id ASC"
+        ).fetchall()
+    finally:
+        manifest.close()
+
+    updated = 0
+    for row in rows:
+        shard_path = _resolve_manifest_shard_path(root_dir, row["path"])
+        if not shard_path.exists():
+            continue
+        shard = connect(shard_path)
+        try:
+            if _table_exists(shard, "archive_senders"):
+                continue
+            ensure_archive_sender_table(shard)
+            shard.commit()
+            updated += 1
+        finally:
+            shard.close()
+    return updated
 
 
 def select_shard(
@@ -478,6 +770,7 @@ def persist_archive_message_with_result(
     *,
     tracked_db_path: Path | None = None,
     archive_root_dir: Path | None = None,
+    sender: ArchiveSender | None = None,
 ) -> ArchiveMessagePersistResult:
     """Persist an archive message and report whether it inserted a new row."""
     ensure_shard_schema(conn)
@@ -504,6 +797,8 @@ def persist_archive_message_with_result(
             archive_root_dir=archive_root_dir,
             created=created,
         )
+        if sender is not None:
+            _persist_archive_sender_in_transaction(conn, sender)
     except Exception:
         if started_transaction:
             conn.rollback()
@@ -511,6 +806,37 @@ def persist_archive_message_with_result(
     if started_transaction:
         conn.commit()
     return result
+
+
+def _persist_archive_sender_in_transaction(
+    conn: sqlite3.Connection,
+    sender: ArchiveSender,
+) -> None:
+    first_seen_at = _ensure_utc(sender.first_seen_at)
+    last_seen_at = _ensure_utc(sender.last_seen_at)
+    if last_seen_at < first_seen_at:
+        first_seen_at, last_seen_at = last_seen_at, first_seen_at
+    username = _normalize_username(sender.username)
+    display_name = _normalize_optional_text(sender.display_name)
+    conn.execute(
+        """
+        INSERT INTO archive_senders (
+            sender_id, username, display_name, first_seen_at, last_seen_at
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(sender_id) DO UPDATE SET
+            username=COALESCE(excluded.username, archive_senders.username),
+            display_name=COALESCE(excluded.display_name, archive_senders.display_name),
+            first_seen_at=MIN(archive_senders.first_seen_at, excluded.first_seen_at),
+            last_seen_at=MAX(archive_senders.last_seen_at, excluded.last_seen_at)
+        """,
+        (
+            sender.sender_id,
+            username,
+            display_name,
+            _serialize_dt(first_seen_at),
+            _serialize_dt(last_seen_at),
+        ),
+    )
 
 
 def _persist_archive_message_in_transaction(
@@ -1912,12 +2238,30 @@ def _fetch_context_messages_from_shard(
         tracked_join = ""
         query_params = [*tracked_path_values, *params]
 
+    if _table_exists(conn, "archive_senders"):
+        sender_select = """
+            s.username AS sender_username,
+            s.display_name AS sender_display_name,
+            s.first_seen_at AS sender_first_seen_at,
+            s.last_seen_at AS sender_last_seen_at
+        """
+        sender_join = "LEFT JOIN archive_senders AS s ON s.sender_id = a.sender_id"
+    else:
+        sender_select = """
+            NULL AS sender_username,
+            NULL AS sender_display_name,
+            NULL AS sender_first_seen_at,
+            NULL AS sender_last_seen_at
+        """
+        sender_join = ""
+
     try:
         rows = conn.execute(
             f"""
-            SELECT a.*, {tracked_select}
+            SELECT a.*, {tracked_select}, {sender_select}
             FROM archive_messages AS a
             {tracked_join}
+            {sender_join}
             WHERE a.chat_id = ?
               AND a.date >= ?
               AND a.date <= ?
@@ -2133,6 +2477,15 @@ def _row_to_context_message(
         media = ()
     else:
         effective_text = text
+    sender = None
+    if row["sender_first_seen_at"] is not None and row["sender_id"] is not None:
+        sender = ArchiveSender(
+            sender_id=int(row["sender_id"]),
+            username=_normalize_username(row["sender_username"]),
+            display_name=_normalize_optional_text(row["sender_display_name"]),
+            first_seen_at=_deserialize_dt(row["sender_first_seen_at"]),
+            last_seen_at=_deserialize_dt(row["sender_last_seen_at"]),
+        )
     return ArchiveContextMessage(
         chat_id=int(row["chat_id"]),
         message_id=int(row["message_id"]),
@@ -2163,6 +2516,7 @@ def _row_to_context_message(
             int(row["reply_to_top_id"]) if row["reply_to_top_id"] is not None else None
         ),
         media=media,
+        sender=sender,
     )
 
 
@@ -2211,6 +2565,31 @@ def _deserialize_dt(raw: str | None) -> datetime:
     if raw is None:
         raise ValueError("datetime value is missing")
     return datetime.fromisoformat(raw).astimezone(timezone.utc)
+
+
+def _normalize_optional_text(value: object) -> str | None:
+    if value is None:
+        return None
+    normalized = " ".join(str(value).split())
+    return normalized or None
+
+
+def _normalize_username(value: object) -> str | None:
+    normalized = _normalize_optional_text(value)
+    if normalized is None:
+        return None
+    normalized = normalized.lstrip("@").strip()
+    return normalized or None
+
+
+def _row_to_archive_sender(row: sqlite3.Row) -> ArchiveSender:
+    return ArchiveSender(
+        sender_id=int(row["sender_id"]),
+        username=_normalize_username(row["username"]),
+        display_name=_normalize_optional_text(row["display_name"]),
+        first_seen_at=_deserialize_dt(row["first_seen_at"]),
+        last_seen_at=_deserialize_dt(row["last_seen_at"]),
+    )
 
 
 def _utc_now() -> datetime:

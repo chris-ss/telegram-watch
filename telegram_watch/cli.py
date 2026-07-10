@@ -21,7 +21,9 @@ from .full_archive_storage import (
     ArchiveStatusReport,
     fetch_context_result,
     find_tracked_message_date,
+    format_archive_sender_label,
     inspect_archive_status,
+    only_archive_sender_schema_missing,
     repair_archive_metadata,
     tracked_message_date_lookup_error,
 )
@@ -30,6 +32,7 @@ from .doctor import run_doctor
 from .gui import run_gui
 from .runner import (
     run_archive_backfill,
+    run_archive_senders_backfill,
     run_daemon,
     run_list_topics,
     run_once,
@@ -44,6 +47,7 @@ _TELEGRAM_RUNTIME_COMMANDS = {
     "run",
     "cleanup-replies",
     "archive-backfill",
+    "archive-senders-backfill",
     "list-topics",
 }
 
@@ -141,6 +145,30 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Scan only without writing archive DB (default)",
+    )
+    sender_backfill_parser = subparsers.add_parser(
+        "archive-senders-backfill",
+        help="Backfill local sender display snapshots for full-message archive",
+        parents=[common],
+    )
+    sender_backfill_parser.add_argument(
+        "--limit",
+        type=int,
+        help=(
+            "Non-negative maximum distinct senders to resolve; 0 is a no-op "
+            "that does not connect to Telegram (default: all missing senders)"
+        ),
+    )
+    sender_backfill_mode = sender_backfill_parser.add_mutually_exclusive_group()
+    sender_backfill_mode.add_argument(
+        "--apply",
+        action="store_true",
+        help="Resolve and write sender snapshots (default is dry-run)",
+    )
+    sender_backfill_mode.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Count missing sender snapshots without Telegram requests (default)",
     )
     subparsers.add_parser(
         "archive-status",
@@ -334,6 +362,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 dry_run=bool(args.dry_run),
             )
         )
+    elif args.command == "archive-senders-backfill":
+        config = _load_config_or_exit(parser, args.config, command=args.command)
+        return asyncio.run(
+            _run_archive_senders_backfill_command(
+                config,
+                limit=args.limit,
+                apply=bool(args.apply),
+                dry_run=bool(args.dry_run),
+            )
+        )
     elif args.command == "archive-status":
         config = _load_config_or_exit(parser, args.config, command=args.command)
         return _run_archive_status_command(config)
@@ -388,6 +426,7 @@ def _load_config_or_exit(
             "run",
             "once",
             "archive-backfill",
+            "archive-senders-backfill",
             "archive-status",
             "archive-repair",
             "archive-context",
@@ -533,6 +572,59 @@ async def _run_archive_backfill_command(
     return 0
 
 
+async def _run_archive_senders_backfill_command(
+    config: Config,
+    *,
+    limit: int | None,
+    apply: bool,
+    dry_run: bool = False,
+) -> int:
+    if apply and dry_run:
+        Console().print(
+            "[bold red]Archive sender backfill error:[/bold red] "
+            "--apply and --dry-run cannot be used together"
+        )
+        return 2
+    if limit is not None and limit < 0:
+        Console().print(
+            "[bold red]Archive sender backfill error:[/bold red] "
+            "archive-senders-backfill limit must be >= 0"
+        )
+        raise SystemExit(2)
+    if apply and limit != 0:
+        preflight_result = _archive_senders_backfill_apply_preflight(config)
+        if preflight_result != 0:
+            return preflight_result
+    try:
+        stats = await run_archive_senders_backfill(
+            config,
+            limit=limit,
+            apply=apply,
+        )
+    except ValueError as exc:
+        Console().print(f"[bold red]Archive sender backfill error:[/bold red] {exc}")
+        raise SystemExit(2)
+    Console().print(
+        "\n".join(
+            [
+                f"Missing sender snapshots: {stats.candidates}",
+                f"Sender schema updates: {stats.schema_updates}",
+                f"Reused archive snapshots: {stats.reused}",
+                f"Resolved from session cache: {stats.cached}",
+                f"Resolved from Telegram history: {stats.fetched}",
+                f"Unresolved senders: {stats.unresolved}",
+                f"Written senders: {stats.written_senders}",
+                f"Shard writes: {stats.shard_writes}",
+            ]
+        )
+    )
+    if stats.dry_run:
+        Console().print(
+            "Dry-run only. Re-run with --apply to resolve and persist sender snapshots."
+        )
+    return 0
+
+
 def _archive_backfill_effective_limit(config: Config, limit: int | None) -> int:
     return limit if limit is not None else config.full_archive.backfill_limit_messages
 
@@ -559,6 +651,27 @@ def _archive_backfill_apply_preflight(config: Config) -> int:
     return 2
 
 
+def _archive_senders_backfill_apply_preflight(config: Config) -> int:
+    archive = config.full_archive
+    if not archive.enabled:
+        return 0
+    report = inspect_archive_status(
+        archive.root_dir,
+        tracked_db_path=config.storage.db_path,
+    )
+    if not report.degraded or only_archive_sender_schema_missing(report):
+        return 0
+
+    Console().print(
+        "[bold red]Archive sender backfill error:[/bold red] "
+        "archive health is degraded; run archive-status and "
+        "archive-repair --dry-run before --apply."
+    )
+    if report.errors:
+        Console().print("Archive health errors:")
+        for error in report.errors:
+            Console().print(f"- {error}")
+    return 2
 def _run_archive_status_command(config: Config) -> int:
     archive = config.full_archive
     Console().print(f"Enabled: {archive.enabled}")
@@ -786,12 +899,22 @@ def _run_archive_context_command(
             archived_topic_id=result.target_archived_topic_id,
         )
     Console().print(
-        f"{'Date':<25} {'Target':<6} {'Sender':<14} {'Mode':<12} {'Topic':<10} {'Reply':<24} {'Message':<10}"
+        f"{'Date':<25} {'Target':<6} {'Sender':<32} {'Mode':<12} {'Topic':<10} {'Reply':<24} {'Message':<10}"
     )
-    Console().print("-" * 116)
+    Console().print("-" * 134)
     for row in rows:
+        sender_alias = (
+            config.resolve_user_alias(row.sender_id, chat_id=row.chat_id)
+            if row.sender_id is not None
+            else None
+        )
         Console().print(
-            _format_context_row(row, target_chat_id=chat_id, target_message_id=message_id)
+            _format_context_row(
+                row,
+                target_chat_id=chat_id,
+                target_message_id=message_id,
+                sender_alias=sender_alias,
+            )
         )
     if result.skipped_shards:
         _print_context_skips(result.skipped_shards)
@@ -874,13 +997,17 @@ def _format_context_row(
     *,
     target_chat_id: int | None = None,
     target_message_id: int | None = None,
+    sender_alias: str | None = None,
 ) -> str:
     target = (
         "*"
         if row.chat_id == target_chat_id and row.message_id == target_message_id
         else ""
     )
-    sender = "" if row.sender_id is None else str(row.sender_id)
+    sender = _short_text(
+        format_archive_sender_label(row.sender, alias=sender_alias),
+        limit=32,
+    )
     topic = "-" if row.topic_id is None else str(row.topic_id)
     reply = _format_context_reply(row)
     text = _short_text(row.effective_text)
@@ -890,7 +1017,7 @@ def _format_context_row(
     metadata = (
         f"{row.date.isoformat():<25} "
         f"{target:<6} "
-        f"{sender:<14} "
+        f"{sender:<32} "
         f"{row.payload_mode:<12} "
         f"{topic:<10} "
         f"{reply:<24} "

@@ -53,6 +53,167 @@ def test_manifest_and_shard_schema_are_idempotent(tmp_path):
     assert shard.execute("SELECT COUNT(*) FROM archive_media").fetchone()[0] == 0
 
 
+def test_archive_sender_upsert_preserves_seen_range_and_known_fields(tmp_path):
+    shard = archive_storage.connect(tmp_path / "shard.sqlite3")
+    first = datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
+    last = first + timedelta(days=2)
+    try:
+        archive_storage.persist_archive_sender(
+            shard,
+            archive_storage.ArchiveSender(
+                sender_id=123,
+                username="alice",
+                display_name="Alice Old",
+                first_seen_at=first + timedelta(hours=1),
+                last_seen_at=last - timedelta(hours=1),
+            ),
+        )
+        archive_storage.persist_archive_sender(
+            shard,
+            archive_storage.ArchiveSender(
+                sender_id=123,
+                username=None,
+                display_name="Alice New",
+                first_seen_at=first,
+                last_seen_at=last,
+            ),
+        )
+        sender = archive_storage.fetch_archive_sender(shard, 123)
+    finally:
+        shard.close()
+
+    assert sender == archive_storage.ArchiveSender(
+        sender_id=123,
+        username="alice",
+        display_name="Alice New",
+        first_seen_at=first,
+        last_seen_at=last,
+    )
+
+
+def test_archive_sender_label_never_falls_back_to_raw_id() -> None:
+    sender = archive_storage.ArchiveSender(
+        sender_id=987654321,
+        username="alice",
+        display_name="Alice",
+        first_seen_at=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        last_seen_at=datetime(2026, 5, 2, tzinfo=timezone.utc),
+    )
+
+    assert archive_storage.format_archive_sender_label(sender, alias="Core analyst") == "Core analyst"
+    assert archive_storage.format_archive_sender_label(sender) == "Alice (@alice)"
+    assert archive_storage.format_archive_sender_label(None) == "Anonymous sender"
+    assert "987654321" not in archive_storage.format_archive_sender_label(None)
+
+
+def test_archive_sender_candidates_reuse_snapshot_across_shards(tmp_path):
+    root_dir = tmp_path / "full_archive"
+    manifest = archive_storage.connect(root_dir / "manifest.sqlite3")
+    may = datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
+    june = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
+    shard_paths = []
+    try:
+        for message_id, message_date in ((1, may), (2, june)):
+            shard_meta = archive_storage.select_shard(
+                manifest,
+                root_dir,
+                chat_id=-1001,
+                message_date=message_date,
+                max_messages_per_shard=500_000,
+                max_shard_size_bytes=1024 * 1024,
+            )
+            shard_paths.append(shard_meta.path)
+            shard = archive_storage.connect(shard_meta.path)
+            try:
+                sender = None
+                if message_id == 1:
+                    sender = archive_storage.ArchiveSender(
+                        sender_id=123,
+                        username="alice",
+                        display_name="Alice",
+                        first_seen_at=may,
+                        last_seen_at=may,
+                    )
+                archive_storage.persist_archive_message_with_result(
+                    shard,
+                    archive_message(message_id, date=message_date),
+                    sender=sender,
+                )
+                archive_storage.record_shard_write(manifest, shard_meta)
+            finally:
+                shard.close()
+    finally:
+        manifest.close()
+
+    candidates = archive_storage.list_archive_sender_candidates(root_dir)
+
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate.sender_id == 123
+    assert candidate.first_seen_at == may
+    assert candidate.last_seen_at == june
+    assert candidate.existing_sender is not None
+    assert candidate.existing_sender.display_name == "Alice"
+    assert set(candidate.shard_paths) == set(shard_paths)
+
+    snapshot = archive_storage.ArchiveSender(
+        sender_id=123,
+        username=candidate.existing_sender.username,
+        display_name=candidate.existing_sender.display_name,
+        first_seen_at=candidate.first_seen_at,
+        last_seen_at=candidate.last_seen_at,
+    )
+    assert archive_storage.persist_archive_sender_to_shards(
+        snapshot,
+        candidate.shard_paths,
+    ) == 2
+    assert archive_storage.list_archive_sender_candidates(root_dir) == ()
+
+
+def test_ensure_archive_sender_schema_updates_registered_shards_without_senders(
+    tmp_path,
+):
+    root_dir = tmp_path / "full_archive"
+    manifest = archive_storage.connect(root_dir / "manifest.sqlite3")
+    message_date = datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
+    try:
+        shard_meta = archive_storage.select_shard(
+            manifest,
+            root_dir,
+            chat_id=-1001,
+            message_date=message_date,
+            max_messages_per_shard=500_000,
+            max_shard_size_bytes=1024 * 1024,
+        )
+        shard = archive_storage.connect(shard_meta.path)
+        try:
+            archive_storage.persist_archive_message(
+                shard,
+                archive_message(1, sender_id=None, date=message_date),
+            )
+            shard.execute("DROP TABLE archive_senders")
+            shard.commit()
+            archive_storage.record_shard_write(manifest, shard_meta)
+        finally:
+            shard.close()
+    finally:
+        manifest.close()
+
+    assert archive_storage.ensure_archive_sender_schema(root_dir) == 1
+    assert archive_storage.ensure_archive_sender_schema(root_dir) == 0
+    shard = archive_storage.connect_readonly(shard_meta.path)
+    try:
+        sender_table = shard.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+            ("archive_senders",),
+        ).fetchone()
+    finally:
+        shard.close()
+
+    assert sender_table is not None
+    assert archive_storage.list_archive_sender_candidates(root_dir) == ()
+
+
 def test_deleting_archive_root_does_not_affect_tracked_db(tmp_path):
     root_dir = tmp_path / "data" / "full_archive"
     tracked_db_path = tmp_path / "data" / "tgwatch.sqlite3"

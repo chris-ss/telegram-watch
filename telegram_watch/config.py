@@ -217,6 +217,16 @@ class Config:
             return f"{alias} ({user_id})" if include_id else alias
         return str(user_id)
 
+    def resolve_user_alias(
+        self,
+        user_id: int,
+        *,
+        target: TargetGroupConfig | None = None,
+        chat_id: int | None = None,
+    ) -> str | None:
+        """Return a configured alias without adding the raw user ID."""
+        return self._resolve_alias(user_id, target=target, chat_id=chat_id)
+
     def _resolve_target(
         self,
         *,
