@@ -1,5 +1,5 @@
 @echo off
-setlocal
+setlocal EnableExtensions EnableDelayedExpansion
 
 cd /d "%~dp0"
 
@@ -44,7 +44,11 @@ if %errorlevel% == 0 (
 
 if "%USE_CONDA%"=="1" (
   set "INSTALL_MARKER=.conda-tgwatch-installed"
-  if not exist "%INSTALL_MARKER%" (
+  set "NEEDS_INSTALL=0"
+  if not exist "!INSTALL_MARKER!" set "NEEDS_INSTALL=1"
+  %PY_CMD% -c "from importlib.metadata import version; raise SystemExit(0 if version('Telethon') == '1.44.0' else 1)" >nul 2>&1
+  if errorlevel 1 set "NEEDS_INSTALL=1"
+  if "!NEEDS_INSTALL!"=="1" (
     %PY_CMD% -m pip install -U pip setuptools wheel
     if errorlevel 1 (
       echo [tgwatch] Warning: failed to upgrade pip/setuptools/wheel; continuing.
@@ -54,7 +58,7 @@ if "%USE_CONDA%"=="1" (
       echo [tgwatch] Error: project install failed. Check network/proxy/pip index settings.
       exit /b 1
     )
-    type nul > "%INSTALL_MARKER%"
+    type nul > "!INSTALL_MARKER!"
   )
   echo [tgwatch] Environment source: conda (tgwatch)
 ) else (
@@ -73,7 +77,11 @@ if "%USE_CONDA%"=="1" (
   )
 
   set "INSTALL_MARKER=.venv\.tgwatch_installed"
-  if not exist "%INSTALL_MARKER%" (
+  set "NEEDS_INSTALL=0"
+  if not exist "!INSTALL_MARKER!" set "NEEDS_INSTALL=1"
+  ".venv\Scripts\python.exe" -c "from importlib.metadata import version; raise SystemExit(0 if version('Telethon') == '1.44.0' else 1)" >nul 2>&1
+  if errorlevel 1 set "NEEDS_INSTALL=1"
+  if "!NEEDS_INSTALL!"=="1" (
     ".venv\Scripts\python.exe" -m pip install -U pip setuptools wheel
     if errorlevel 1 (
       echo [tgwatch] Warning: failed to upgrade pip/setuptools/wheel; continuing.
@@ -83,7 +91,7 @@ if "%USE_CONDA%"=="1" (
       echo [tgwatch] Error: project install failed. Check network/proxy/pip index settings.
       exit /b 1
     )
-    type nul > "%INSTALL_MARKER%"
+    type nul > "!INSTALL_MARKER!"
   )
   set "PY_CMD=.venv\Scripts\python.exe"
   echo [tgwatch] Environment source: venv (.venv)

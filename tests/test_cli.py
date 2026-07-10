@@ -3338,6 +3338,25 @@ def test_runtime_version_labels_marks_missing_telethon_unknown(monkeypatch) -> N
     assert telethon_version == "unknown"
 
 
+def test_network_command_stops_before_config_when_telethon_is_incompatible(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    monkeypatch.setattr(
+        cli_module,
+        "telethon_runtime_problem",
+        lambda: "Telethon 1.44.0 is required; found 1.42.0.",
+    )
+
+    result = cli_module.main(
+        ["once", "--config", str(tmp_path / "missing.toml"), "--since", "10m"]
+    )
+
+    assert result == 2
+    assert "Runtime error" in capsys.readouterr().out
+
+
 def test_archive_qa_config_labels_do_not_include_chat_or_topic_ids(tmp_path) -> None:
     config_path = tmp_path / "config.toml"
     config_path.write_text(
