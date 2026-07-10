@@ -3,7 +3,11 @@ from textwrap import dedent
 
 from telegram_watch.config import load_config
 from telegram_watch import doctor as doctor_mod
-from telegram_watch.doctor import _check_full_archive, run_doctor
+from telegram_watch.doctor import (
+    _check_full_archive,
+    _check_telethon_runtime,
+    run_doctor,
+)
 
 
 def write_config(tmp_path: Path, body: str) -> Path:
@@ -45,6 +49,20 @@ def test_full_archive_doctor_disabled_does_not_create_archive_dir(tmp_path):
     assert results[0].ok is True
     assert results[0].detail == "disabled"
     assert not config.full_archive.root_dir.exists()
+
+
+def test_telethon_runtime_check_reports_incompatible_version(monkeypatch):
+    monkeypatch.setattr(
+        doctor_mod,
+        "telethon_runtime_problem",
+        lambda: "Telethon 1.44.0 is required; found 1.42.0.",
+    )
+
+    result = _check_telethon_runtime()
+
+    assert result.ok is False
+    assert result.name == "Telethon runtime"
+    assert "found 1.42.0" in result.detail
 
 
 def test_full_archive_doctor_enabled_creates_manifest(tmp_path):

@@ -9,6 +9,7 @@
 - 全量归档中的 tracked 消息通过 `tracked_ref` 连接回现有 tracked 数据库，避免重复保存被追踪消息正文和媒体元数据，同时保留足够的时间线信息供后续 `archive-context` 查询使用。
 - 新增全量归档运维命令：`archive-backfill`、`archive-status`、`archive-repair`、`archive-context`、`list-topics`、`archive-qa-init`，并提供默认关闭配置、降级状态启动拦截、修复诊断，以及 gitignored 的真实 Telegram QA 证据模板。
 - 发送端账号临时断线时，会先重新连接已配置的 sender 并用 sender 重试；如果最终仍需回退到主账号，会向控制群发送可见告警，避免 daemon 长时间运行后桥接消息静默改由主账号发送。
+- 使用经过验证的 Telethon 1.44.0 parser 兼容 Telegram 的 `message#3ae56482` 响应，并让已有启动环境自动刷新过期的 Telethon，同时保留现有 session。
 
 ## 1.7.0 — 2026-04-14
 - 新增全局消息模板切换，对**所有转发到控制群的单条消息**生效——无论 `interval` 模式（每次定时汇总后逐条转发）还是 `realtime` 模式（即时推送），均按所选模板渲染。在「显示与通知」中可在 `Normal`（标准）与 `Minimal`（极简）之间选择。极简模板把发送者与正文合并到第一行，时间下移到第二行；标准模板维持原有分行版面。GUI 侧新增实时预览面板，可直观对比两种样式。ID 显示、时间格式、语言等既有定制项均叠加生效；老配置缺少 `display.template` 键时自动回退为 `normal`，无需手动迁移。

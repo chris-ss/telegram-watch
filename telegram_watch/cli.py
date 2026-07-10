@@ -35,7 +35,17 @@ from .runner import (
     run_once,
     run_reply_cleanup,
 )
+from .telethon_compat import telethon_runtime_problem
 from .timeutils import parse_since_spec, utc_now
+
+
+_TELEGRAM_RUNTIME_COMMANDS = {
+    "once",
+    "run",
+    "cleanup-replies",
+    "archive-backfill",
+    "list-topics",
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -275,6 +285,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     logging.getLogger("telethon").setLevel(logging.WARNING)
+    if args.command in _TELEGRAM_RUNTIME_COMMANDS:
+        runtime_problem = telethon_runtime_problem()
+        if runtime_problem is not None:
+            Console().print(f"[bold red]Runtime error:[/bold red] {runtime_problem}")
+            return 2
     if args.command == "doctor":
         config = _load_config_or_exit(parser, args.config, command=args.command)
         run_doctor(config)

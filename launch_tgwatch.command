@@ -99,13 +99,17 @@ install_project() {
   fi
 }
 
+telethon_runtime_ready() {
+  python -c 'from importlib.metadata import version; raise SystemExit(0 if version("Telethon") == "1.44.0" else 1)' >/dev/null 2>&1
+}
+
 if [ "$USE_CONDA" -eq 1 ]; then
   if ! python -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'; then
     echo "[tgwatch] Conda environment must use Python 3.11+"
     exit 1
   fi
   INSTALL_MARKER=".conda-tgwatch-installed"
-  if [ ! -f "$INSTALL_MARKER" ]; then
+  if [ ! -f "$INSTALL_MARKER" ] || [ pyproject.toml -nt "$INSTALL_MARKER" ] || ! telethon_runtime_ready; then
     install_project
     touch "$INSTALL_MARKER"
   fi
@@ -133,7 +137,7 @@ else
   fi
 
   INSTALL_MARKER=".venv/.tgwatch_installed"
-  if [ ! -f "$INSTALL_MARKER" ]; then
+  if [ ! -f "$INSTALL_MARKER" ] || [ pyproject.toml -nt "$INSTALL_MARKER" ] || ! telethon_runtime_ready; then
     install_project
     touch "$INSTALL_MARKER"
   fi
