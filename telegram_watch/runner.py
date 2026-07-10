@@ -1283,9 +1283,9 @@ class _FullArchiveHandler:
                     entity = await entity
             else:
                 entity = getattr(event.message, "sender", None)
+            return _sender_identity_from_entity(entity)
         except Exception:
             return None
-        return _sender_identity_from_entity(entity)
 
 
 def _schedule_archive_relink_after_tracked_persist(

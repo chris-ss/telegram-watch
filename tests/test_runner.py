@@ -737,6 +737,44 @@ async def test_full_archive_handler_keeps_message_when_sender_lookup_fails(
 
 
 @pytest.mark.asyncio
+async def test_full_archive_handler_keeps_message_when_sender_entity_is_invalid(
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    handler = runner._FullArchiveHandler(config)
+
+    async def get_sender():
+        return object()
+
+    await handler.handle(
+        SimpleNamespace(
+            message=make_archive_event_message(sender_id=999),
+            get_sender=get_sender,
+        )
+    )
+
+    shard_path = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-05.sqlite3"
+    )
+    conn = sqlite3.connect(shard_path)
+    try:
+        message_count = conn.execute(
+            "SELECT COUNT(*) FROM archive_messages"
+        ).fetchone()[0]
+        sender_count = conn.execute(
+            "SELECT COUNT(*) FROM archive_senders"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    assert message_count == 1
+    assert sender_count == 0
+
+
+@pytest.mark.asyncio
 async def test_full_archive_handler_stores_media_metadata_without_download(
     monkeypatch,
     tmp_path: Path,
