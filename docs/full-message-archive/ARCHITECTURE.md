@@ -227,7 +227,7 @@ CREATE TABLE archive_senders (
 
 写入与回填规则：
 
-- live capture 对每个 sender 首次调用 `event.get_sender()`，成功结果在 daemon 内长期缓存；失败结果只进入短暂 cooldown，之后自动重试，避免瞬时故障永久缺失名称或每条消息重复请求 Telegram；
+- live capture 对每个 sender 首次调用 `event.get_sender()`，成功结果在 daemon 内长期缓存；普通失败只进入短暂 cooldown，之后自动重试；如果 Telegram 返回 FloodWait，则重试期限至少遵守服务端要求的等待秒数，避免瞬时故障永久缺失名称、逐消息请求或提前重试；
 - sender snapshot 与消息在同一 shard transaction 中 upsert，`first_seen_at` 只向前扩展，`last_seen_at` 只向后扩展，缺失字段不会清空已有名称；
 - `tracked_ref` 行同样保存 sender snapshot，但仍不重复保存 tracked 正文和媒体 metadata；
 - `archive-senders-backfill` 从所有 shard 聚合 distinct `sender_id`，优先读取 Telethon session entity cache，未命中时用一条已归档消息的 `get_sender()` 解析，并对 FloodWait 自动退避；

@@ -800,6 +800,55 @@ async def test_full_archive_handler_retries_sender_after_failure_cooldown(
 
 
 @pytest.mark.asyncio
+async def test_full_archive_handler_honors_sender_lookup_floodwait(
+    tmp_path: Path,
+    caplog,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    handler = runner._FullArchiveHandler(config)
+    sender_calls = 0
+
+    async def get_sender():
+        nonlocal sender_calls
+        sender_calls += 1
+        raise errors.FloodWaitError(None, 120)
+
+    loop = asyncio.get_running_loop()
+    with caplog.at_level(logging.WARNING):
+        for message_id in (1, 2):
+            await handler.handle(
+                SimpleNamespace(
+                    message=make_archive_event_message(
+                        message_id=message_id,
+                        sender_id=999,
+                    ),
+                    get_sender=get_sender,
+                )
+            )
+
+    retry_delay = handler._sender_lookup_retry_after[999] - loop.time()
+    shard_path = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-05.sqlite3"
+    )
+    conn = sqlite3.connect(shard_path)
+    try:
+        message_count = conn.execute(
+            "SELECT COUNT(*) FROM archive_messages"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    assert sender_calls == 1
+    assert retry_delay > 119
+    assert retry_delay <= 121
+    assert message_count == 2
+    assert "FloodWait during full archive sender lookup" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_full_archive_handler_keeps_message_when_sender_entity_is_invalid(
     tmp_path: Path,
 ):

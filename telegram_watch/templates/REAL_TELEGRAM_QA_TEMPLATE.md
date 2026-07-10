@@ -188,6 +188,7 @@ python -m tgwatch archive-context --config config.toml --chat <target_chat_id> -
 - apply 输出区分 session cache、Telegram history、unresolved 和 shard writes，且日志/证据不包含 raw sender ID：
 - 同一 sender 在一次 apply 中最多查询一次；触发 FloodWait 时自动等待并继续：
 - live sender lookup 瞬时失败时消息仍归档，cooldown 后的新消息会重新解析并补上 snapshot：
+- live sender lookup 遇到超过普通 cooldown 的 FloodWait 时，不会在服务端等待时间结束前重试：
 - 第二次 dry-run 的缺失数量按成功写入数下降；unresolved sender 不阻塞其他 sender：
 - daemon 重启后，新的普通消息会自动写入 `archive_senders`，同一 sender 后续消息只扩展 first/last seen 时间：
 - tracked message 仍是 `tracked_ref`，无重复正文/媒体 metadata，同时对应 sender snapshot 可用：

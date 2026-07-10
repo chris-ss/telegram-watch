@@ -1297,6 +1297,17 @@ class _FullArchiveHandler:
             self._sender_lookup_tasks[sender_id] = task
         try:
             identity = await task
+        except errors.FloodWaitError as exc:
+            wait_for = max(
+                ARCHIVE_SENDER_LOOKUP_RETRY_SECONDS,
+                float(exc.seconds + 1),
+            )
+            self._sender_lookup_retry_after[sender_id] = loop.time() + wait_for
+            logger.warning(
+                "FloodWait during full archive sender lookup; retrying after %ss",
+                wait_for,
+            )
+            return None
         finally:
             self._sender_lookup_tasks.pop(sender_id, None)
         if identity is None:
@@ -1323,6 +1334,8 @@ class _FullArchiveHandler:
             else:
                 entity = getattr(event.message, "sender", None)
             return _sender_identity_from_entity(entity)
+        except errors.FloodWaitError:
+            raise
         except Exception:
             return None
 
