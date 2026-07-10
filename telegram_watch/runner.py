@@ -72,6 +72,7 @@ _SENDER_FALLBACK_ALERT = (
 ARCHIVE_BACKFILL_WAIT_THRESHOLD = 1_000
 ARCHIVE_BACKFILL_WAIT_TIME_SECONDS = 1.0
 ARCHIVE_RELINK_SHUTDOWN_TIMEOUT_SECONDS = 5.0
+ARCHIVE_SENDER_LOOKUP_RETRY_SECONDS = 60.0
 
 
 @dataclass
@@ -1212,7 +1213,8 @@ class _TargetHandler:
 class _FullArchiveHandler:
     def __init__(self, config: Config):
         self.config = config
-        self._sender_identity_cache: dict[int, _ArchiveSenderIdentity | None] = {}
+        self._sender_identity_cache: dict[int, _ArchiveSenderIdentity] = {}
+        self._sender_lookup_retry_after: dict[int, float] = {}
         self._sender_lookup_tasks: dict[
             int,
             asyncio.Task[_ArchiveSenderIdentity | None],
@@ -1269,6 +1271,10 @@ class _FullArchiveHandler:
     ) -> _ArchiveSenderIdentity | None:
         if sender_id in self._sender_identity_cache:
             return self._sender_identity_cache[sender_id]
+        loop = asyncio.get_running_loop()
+        retry_after = self._sender_lookup_retry_after.get(sender_id)
+        if retry_after is not None and loop.time() < retry_after:
+            return None
         task = self._sender_lookup_tasks.get(sender_id)
         if task is None:
             task = asyncio.create_task(self._load_sender_identity(event))
@@ -1277,6 +1283,12 @@ class _FullArchiveHandler:
             identity = await task
         finally:
             self._sender_lookup_tasks.pop(sender_id, None)
+        if identity is None:
+            self._sender_lookup_retry_after[sender_id] = (
+                loop.time() + ARCHIVE_SENDER_LOOKUP_RETRY_SECONDS
+            )
+            return None
+        self._sender_lookup_retry_after.pop(sender_id, None)
         self._sender_identity_cache[sender_id] = identity
         return identity
 

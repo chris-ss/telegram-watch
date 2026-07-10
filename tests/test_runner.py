@@ -737,6 +737,69 @@ async def test_full_archive_handler_keeps_message_when_sender_lookup_fails(
 
 
 @pytest.mark.asyncio
+async def test_full_archive_handler_retries_sender_after_failure_cooldown(
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    handler = runner._FullArchiveHandler(config)
+    sender_calls = 0
+
+    async def get_sender():
+        nonlocal sender_calls
+        sender_calls += 1
+        if sender_calls == 1:
+            raise RuntimeError("temporary sender lookup failure")
+        return tl_types.User(
+            id=999,
+            first_name="Recovered",
+            last_name="Sender",
+            username="recovered_sender",
+        )
+
+    for message_id in (1, 2):
+        await handler.handle(
+            SimpleNamespace(
+                message=make_archive_event_message(
+                    message_id=message_id,
+                    sender_id=999,
+                ),
+                get_sender=get_sender,
+            )
+        )
+    assert sender_calls == 1
+
+    handler._sender_lookup_retry_after[999] = 0
+    await handler.handle(
+        SimpleNamespace(
+            message=make_archive_event_message(message_id=3, sender_id=999),
+            get_sender=get_sender,
+        )
+    )
+
+    shard_path = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-05.sqlite3"
+    )
+    conn = sqlite3.connect(shard_path)
+    try:
+        message_count = conn.execute(
+            "SELECT COUNT(*) FROM archive_messages"
+        ).fetchone()[0]
+        sender_row = conn.execute(
+            "SELECT username, display_name FROM archive_senders WHERE sender_id = ?",
+            (999,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert sender_calls == 2
+    assert message_count == 3
+    assert sender_row == ("recovered_sender", "Recovered Sender")
+
+
+@pytest.mark.asyncio
 async def test_full_archive_handler_keeps_message_when_sender_entity_is_invalid(
     tmp_path: Path,
 ):
