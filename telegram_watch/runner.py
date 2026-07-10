@@ -493,6 +493,8 @@ async def run_archive_senders_backfill(
         )
     if limit is not None and limit < 0:
         raise ValueError("archive-senders-backfill limit must be >= 0")
+    if limit == 0:
+        return ArchiveSenderBackfillStats(dry_run=not apply)
 
     schema_updates = 0
     if apply:

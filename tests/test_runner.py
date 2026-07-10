@@ -3036,6 +3036,57 @@ async def test_archive_senders_backfill_dry_run_does_not_connect_to_telegram(
 
 
 @pytest.mark.asyncio
+async def test_archive_senders_backfill_zero_limit_is_noop_without_schema_write(
+    monkeypatch,
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    archive_message = runner._archive_message_from_telegram(
+        make_archive_event_message(sender_id=999)
+    )
+    assert archive_message is not None
+    runner._persist_archive_message_to_storage(
+        config,
+        archive_message,
+        tracked_db_path=config.storage.db_path,
+    )
+    shard_path = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-05.sqlite3"
+    )
+    shard = sqlite3.connect(shard_path)
+    try:
+        shard.execute("DROP TABLE archive_senders")
+        shard.commit()
+    finally:
+        shard.close()
+
+    def fail_build_client(_config):
+        raise AssertionError("zero-limit sender backfill must not connect to Telegram")
+
+    monkeypatch.setattr(runner, "_build_client", fail_build_client)
+
+    stats = await runner.run_archive_senders_backfill(config, limit=0, apply=True)
+
+    shard = sqlite3.connect(shard_path)
+    try:
+        sender_table = shard.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+            ("archive_senders",),
+        ).fetchone()
+    finally:
+        shard.close()
+
+    assert stats.candidates == 0
+    assert stats.schema_updates == 0
+    assert stats.written_senders == 0
+    assert stats.dry_run is False
+    assert sender_table is None
+
+
+@pytest.mark.asyncio
 async def test_archive_senders_backfill_reuses_other_shard_without_telegram(
     monkeypatch,
     tmp_path: Path,
