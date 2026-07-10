@@ -183,6 +183,7 @@ python -m tgwatch archive-context --config config.toml --chat <target_chat_id> -
 通过条件：
 
 - 第一次 dry-run 只统计缺少快照的 distinct sender，不连接 Telegram、不写 shard：
+- 模拟旧 shard 仅缺少 `archive_senders` 表时，apply 会自行创建并继续；存在其他 degraded 条件时仍拒绝写入：
 - apply 输出区分 session cache、Telegram history、unresolved 和 shard writes，且日志/证据不包含 raw sender ID：
 - 同一 sender 在一次 apply 中最多查询一次；触发 FloodWait 时自动等待并继续：
 - 第二次 dry-run 的缺失数量按成功写入数下降；unresolved sender 不阻塞其他 sender：

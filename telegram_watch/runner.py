@@ -32,6 +32,7 @@ from .full_archive_storage import (
     ArchiveSenderCandidate,
     archive_message_exists,
     connect as archive_connect,
+    ensure_archive_sender_schema,
     find_shard_for_message,
     inspect_archive_status,
     list_archive_sender_candidates,
@@ -100,6 +101,7 @@ class ArchiveBackfillStats:
 @dataclass
 class ArchiveSenderBackfillStats:
     candidates: int = 0
+    schema_updates: int = 0
     reused: int = 0
     cached: int = 0
     fetched: int = 0
@@ -492,9 +494,16 @@ async def run_archive_senders_backfill(
     if limit is not None and limit < 0:
         raise ValueError("archive-senders-backfill limit must be >= 0")
 
+    schema_updates = 0
+    if apply:
+        schema_updates = await asyncio.to_thread(
+            ensure_archive_sender_schema,
+            archive.root_dir,
+        )
     candidates = list_archive_sender_candidates(archive.root_dir, limit=limit)
     stats = ArchiveSenderBackfillStats(
         candidates=len(candidates),
+        schema_updates=schema_updates,
         dry_run=not apply,
     )
     if not apply or not candidates:

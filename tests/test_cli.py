@@ -1140,6 +1140,7 @@ def test_archive_senders_backfill_prints_aggregate_results_only(
         assert apply is False
         return SimpleNamespace(
             candidates=7,
+            schema_updates=0,
             reused=1,
             cached=3,
             fetched=2,
@@ -1162,11 +1163,79 @@ def test_archive_senders_backfill_prints_aggregate_results_only(
     assert result == 0
     output = capsys.readouterr().out
     assert "Missing sender snapshots: 7" in output
+    assert "Sender schema updates: 0" in output
     assert "Resolved from session cache: 3" in output
     assert "Resolved from Telegram history: 2" in output
     assert "Unresolved senders: 1" in output
     assert "Dry-run only" in output
     assert "sender_id" not in output
+
+
+def test_archive_senders_backfill_apply_allows_missing_sender_schema_only(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    config = _load_full_archive_test_config(tmp_path)
+    _create_archive_with_missing_additive_table(config, "archive_senders")
+
+    async def fake_backfill(_config, *, limit=None, apply=False):
+        assert limit == 10
+        assert apply is True
+        return SimpleNamespace(
+            candidates=1,
+            schema_updates=1,
+            reused=0,
+            cached=1,
+            fetched=0,
+            unresolved=0,
+            written_senders=1,
+            shard_writes=1,
+            dry_run=False,
+        )
+
+    monkeypatch.setattr(cli_module, "run_archive_senders_backfill", fake_backfill)
+
+    result = asyncio.run(
+        _run_archive_senders_backfill_command(
+            config,
+            limit=10,
+            apply=True,
+        )
+    )
+
+    assert result == 0
+    output = capsys.readouterr().out
+    assert "Sender schema updates: 1" in output
+    assert "archive health is degraded" not in output
+
+
+def test_archive_senders_backfill_apply_rejects_other_archive_degradation(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    config = _load_full_archive_test_config(tmp_path)
+    _create_archive_with_missing_additive_table(config, "archive_media")
+
+    async def fail_backfill(*_args, **_kwargs):
+        raise AssertionError("sender backfill must not bypass unrelated degradation")
+
+    monkeypatch.setattr(cli_module, "run_archive_senders_backfill", fail_backfill)
+
+    result = asyncio.run(
+        _run_archive_senders_backfill_command(
+            config,
+            limit=10,
+            apply=True,
+        )
+    )
+
+    assert result == 2
+    output = capsys.readouterr().out
+    assert "Archive sender backfill error" in output
+    assert "archive health is degraded" in output
+    assert "missing schema table(s): archive_media" in output
 
 
 def test_archive_backfill_prints_updated_rows(monkeypatch, tmp_path, capsys) -> None:
@@ -1458,6 +1527,88 @@ def _create_degraded_archive_without_tracked_link(config) -> None:
         shard.close()
     archive_storage.record_shard_write(manifest, shard_meta)
     manifest.close()
+
+
+def _load_full_archive_test_config(tmp_path):
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+        config_version = 1.0
+
+        [telegram]
+        api_id = 42
+        api_hash = "abcdefghijk"
+
+        [target]
+        target_chat_id = -1001
+        tracked_user_ids = [123]
+
+        [control]
+        control_chat_id = -1002
+
+        [storage]
+        db_path = "data/app.sqlite3"
+        media_dir = "data/media"
+
+        [full_archive]
+        enabled = true
+        source_chat_id = -1001
+        root_dir = "data/full_archive"
+        """,
+        encoding="utf-8",
+    )
+    return load_config(config_path)
+
+
+def _create_archive_with_missing_additive_table(config, table_name: str) -> None:
+    tracked = tracked_storage.connect(config.storage.db_path)
+    try:
+        tracked_storage.ensure_schema(tracked)
+    finally:
+        tracked.close()
+
+    message_date = datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
+    manifest = archive_storage.connect(config.full_archive.root_dir / "manifest.sqlite3")
+    try:
+        shard_meta = archive_storage.select_shard(
+            manifest,
+            config.full_archive.root_dir,
+            chat_id=-1001,
+            message_date=message_date,
+            max_messages_per_shard=500_000,
+            max_shard_size_bytes=1024 * 1024,
+        )
+        shard = archive_storage.connect(shard_meta.path)
+        try:
+            archive_storage.persist_archive_message(
+                shard,
+                archive_storage.ArchiveMessage(
+                    chat_id=-1001,
+                    message_id=1,
+                    topic_id=None,
+                    sender_id=456,
+                    date=message_date,
+                    text="context",
+                    raw_text="context",
+                    message_kind="message",
+                    reply_to_msg_id=None,
+                    reply_to_top_id=None,
+                    is_forum_topic_link=False,
+                    has_media=False,
+                ),
+            )
+            shard.execute(f"DROP TABLE {table_name}")
+            shard.commit()
+        finally:
+            shard.close()
+        archive_storage.record_shard_write(manifest, shard_meta)
+        archive_storage.record_tracked_db_link(
+            manifest,
+            config.storage.db_path,
+            archive_root_dir=config.full_archive.root_dir,
+        )
+    finally:
+        manifest.close()
 
 
 def test_archive_backfill_command_rejects_apply_with_dry_run(

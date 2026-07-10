@@ -3000,6 +3000,18 @@ async def test_archive_senders_backfill_dry_run_does_not_connect_to_telegram(
         archive_message,
         tracked_db_path=config.storage.db_path,
     )
+    shard_path = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-05.sqlite3"
+    )
+    shard = sqlite3.connect(shard_path)
+    try:
+        shard.execute("DROP TABLE archive_senders")
+        shard.commit()
+    finally:
+        shard.close()
 
     def fail_build_client(_config):
         raise AssertionError("dry-run sender backfill must not connect to Telegram")
@@ -3009,8 +3021,18 @@ async def test_archive_senders_backfill_dry_run_does_not_connect_to_telegram(
     stats = await runner.run_archive_senders_backfill(config)
 
     assert stats.candidates == 1
+    assert stats.schema_updates == 0
     assert stats.written_senders == 0
     assert stats.dry_run is True
+    shard = sqlite3.connect(shard_path)
+    try:
+        sender_table = shard.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+            ("archive_senders",),
+        ).fetchone()
+    finally:
+        shard.close()
+    assert sender_table is None
 
 
 @pytest.mark.asyncio
@@ -3090,6 +3112,18 @@ async def test_archive_senders_backfill_prefers_session_entity_cache(
         archive_message,
         tracked_db_path=config.storage.db_path,
     )
+    shard_path = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-05.sqlite3"
+    )
+    shard = sqlite3.connect(shard_path)
+    try:
+        shard.execute("DROP TABLE archive_senders")
+        shard.commit()
+    finally:
+        shard.close()
 
     class DummySession:
         def get_cached_sender_identity(self, sender_id):
@@ -3116,12 +3150,6 @@ async def test_archive_senders_backfill_prefers_session_entity_cache(
 
     stats = await runner.run_archive_senders_backfill(config, apply=True)
 
-    shard_path = (
-        config.full_archive.root_dir
-        / "shards"
-        / f"group_{config.full_archive.source_chat_id}"
-        / "2026-05.sqlite3"
-    )
     conn = sqlite3.connect(shard_path)
     try:
         row = conn.execute(
@@ -3131,6 +3159,7 @@ async def test_archive_senders_backfill_prefers_session_entity_cache(
     finally:
         conn.close()
 
+    assert stats.schema_updates == 1
     assert stats.cached == 1
     assert stats.fetched == 0
     assert stats.written_senders == 1

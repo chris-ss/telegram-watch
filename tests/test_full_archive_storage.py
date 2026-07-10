@@ -170,6 +170,50 @@ def test_archive_sender_candidates_reuse_snapshot_across_shards(tmp_path):
     assert archive_storage.list_archive_sender_candidates(root_dir) == ()
 
 
+def test_ensure_archive_sender_schema_updates_registered_shards_without_senders(
+    tmp_path,
+):
+    root_dir = tmp_path / "full_archive"
+    manifest = archive_storage.connect(root_dir / "manifest.sqlite3")
+    message_date = datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
+    try:
+        shard_meta = archive_storage.select_shard(
+            manifest,
+            root_dir,
+            chat_id=-1001,
+            message_date=message_date,
+            max_messages_per_shard=500_000,
+            max_shard_size_bytes=1024 * 1024,
+        )
+        shard = archive_storage.connect(shard_meta.path)
+        try:
+            archive_storage.persist_archive_message(
+                shard,
+                archive_message(1, sender_id=None, date=message_date),
+            )
+            shard.execute("DROP TABLE archive_senders")
+            shard.commit()
+            archive_storage.record_shard_write(manifest, shard_meta)
+        finally:
+            shard.close()
+    finally:
+        manifest.close()
+
+    assert archive_storage.ensure_archive_sender_schema(root_dir) == 1
+    assert archive_storage.ensure_archive_sender_schema(root_dir) == 0
+    shard = archive_storage.connect_readonly(shard_meta.path)
+    try:
+        sender_table = shard.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+            ("archive_senders",),
+        ).fetchone()
+    finally:
+        shard.close()
+
+    assert sender_table is not None
+    assert archive_storage.list_archive_sender_candidates(root_dir) == ()
+
+
 def test_deleting_archive_root_does_not_affect_tracked_db(tmp_path):
     root_dir = tmp_path / "data" / "full_archive"
     tracked_db_path = tmp_path / "data" / "tgwatch.sqlite3"

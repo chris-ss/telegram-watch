@@ -599,6 +599,35 @@ def persist_archive_sender_to_shards(
     return written
 
 
+def ensure_archive_sender_schema(root_dir: Path) -> int:
+    """Create the additive sender table in registered shards that lack it."""
+    manifest_path = root_dir / "manifest.sqlite3"
+    if not manifest_path.exists():
+        return 0
+    manifest = connect_readonly(manifest_path)
+    try:
+        rows = manifest.execute(
+            "SELECT path FROM archive_shards ORDER BY starts_at ASC, shard_id ASC"
+        ).fetchall()
+    finally:
+        manifest.close()
+
+    updated = 0
+    for row in rows:
+        shard_path = _resolve_manifest_shard_path(root_dir, row["path"])
+        if not shard_path.exists():
+            continue
+        shard = connect(shard_path)
+        try:
+            if _table_exists(shard, "archive_senders"):
+                continue
+            ensure_shard_schema(shard)
+            updated += 1
+        finally:
+            shard.close()
+    return updated
+
+
 def select_shard(
     conn: sqlite3.Connection,
     root_dir: Path,

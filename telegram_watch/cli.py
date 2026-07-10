@@ -591,7 +591,7 @@ async def _run_archive_senders_backfill_command(
         )
         raise SystemExit(2)
     if apply and limit != 0:
-        preflight_result = _archive_backfill_apply_preflight(config)
+        preflight_result = _archive_senders_backfill_apply_preflight(config)
         if preflight_result != 0:
             return preflight_result
     try:
@@ -607,6 +607,7 @@ async def _run_archive_senders_backfill_command(
         "\n".join(
             [
                 f"Missing sender snapshots: {stats.candidates}",
+                f"Sender schema updates: {stats.schema_updates}",
                 f"Reused archive snapshots: {stats.reused}",
                 f"Resolved from session cache: {stats.cached}",
                 f"Resolved from Telegram history: {stats.fetched}",
@@ -647,6 +648,43 @@ def _archive_backfill_apply_preflight(config: Config) -> int:
         for error in report.errors:
             Console().print(f"- {error}")
     return 2
+
+
+def _archive_senders_backfill_apply_preflight(config: Config) -> int:
+    archive = config.full_archive
+    if not archive.enabled:
+        return 0
+    report = inspect_archive_status(
+        archive.root_dir,
+        tracked_db_path=config.storage.db_path,
+    )
+    if not report.degraded or _only_archive_sender_schema_is_missing(report):
+        return 0
+
+    Console().print(
+        "[bold red]Archive sender backfill error:[/bold red] "
+        "archive health is degraded; run archive-status and "
+        "archive-repair --dry-run before --apply."
+    )
+    if report.errors:
+        Console().print("Archive health errors:")
+        for error in report.errors:
+            Console().print(f"- {error}")
+    return 2
+
+
+def _only_archive_sender_schema_is_missing(report: ArchiveStatusReport) -> bool:
+    expected_errors = tuple(
+        f"{shard.shard_id}: missing schema table(s): archive_senders"
+        for shard in report.shards
+        if shard.missing_schema_tables == ("archive_senders",)
+    )
+    return bool(expected_errors) and bool(
+        report.missing_shard_count == 0
+        and report.missing_index_count == 0
+        and report.missing_schema_table_count == len(expected_errors)
+        and report.errors == expected_errors
+    )
 
 
 def _run_archive_status_command(config: Config) -> int:
