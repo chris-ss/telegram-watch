@@ -197,7 +197,7 @@ L7 | **起動ウォームアップ** — 起動後数分間は送信レートを
 
 全量アーカイブは任意のローカル文脈レイヤーで、既定では無効です。有効にすると、tgwatch は指定したソースグループまたは指定した forum Topic を `root_dir` 配下の独立した SQLite manifest とシャードへ静かに記録します。既存の tracked-user 通知とレポートは引き続き通常の tracked DB を使用します。
 
-live アーカイブはローカル sender 表示スナップショット（`display_name`、`username`、初回/最終出現時刻）も保存します。この metadata はメッセージ payload と独立しているため、tracked メッセージは引き続き `tracked_ref` のみを保存し、全量アーカイブ側に本文やメディア metadata を重複保存しません。
+live アーカイブはローカル sender 表示スナップショット（`display_name`、`username`、初回/最終出現時刻）も保存します。この metadata はメッセージ payload と独立しているため、tracked メッセージは引き続き `tracked_ref` のみを保存し、全量アーカイブ側に本文やメディア metadata を重複保存しません。daemon 起動時、旧 shard の唯一の health issue が additive `archive_senders` テーブルの欠落である場合は live-capture health gate の前に自動移行し、それ以外の degraded 状態では引き続き live アーカイブ書き込みを無効化します。
 
 項目 | 説明 | 既定値
 ----- | ---- | ------

@@ -232,6 +232,7 @@ CREATE TABLE archive_senders (
 - `tracked_ref` 行同样保存 sender snapshot，但仍不重复保存 tracked 正文和媒体 metadata；
 - `archive-senders-backfill` 从所有 shard 聚合 distinct `sender_id`，优先读取 Telethon session entity cache，未命中时用一条已归档消息的 `get_sender()` 解析，并对 FloodWait 自动退避；
 - 旧 shard 仅缺少 additive `archive_senders` 表时，sender backfill apply 会先自行创建该表；任何其他 degraded 条件仍由健康门禁拦截；
+- daemon 启动时也会在 live-capture 健康门禁前执行同一项 sender-only schema migration，避免升级后静默停止全量归档；
 - 每个 sender 在一次 backfill 中只解析一次，结果写入所有引用它的 shard；无法解析时保留为空，不影响消息归档；
 - 展示优先级是配置中的 tracked-user alias、`display_name` 加 `@username`、匿名标签。任何归档侧输出都不得用 raw sender ID 作为 fallback。
 

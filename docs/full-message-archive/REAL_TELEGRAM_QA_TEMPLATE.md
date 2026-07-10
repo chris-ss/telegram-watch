@@ -184,6 +184,7 @@ python -m tgwatch archive-context --config config.toml --chat <target_chat_id> -
 
 - 第一次 dry-run 只统计缺少快照的 distinct sender，不连接 Telegram、不写 shard：
 - 模拟旧 shard 仅缺少 `archive_senders` 表时，apply 会自行创建并继续；存在其他 degraded 条件时仍拒绝写入：
+- daemon 面对同一 sender-only 旧 schema 时会先迁移并继续注册 live handler，不产生归档缺口：
 - apply 输出区分 session cache、Telegram history、unresolved 和 shard writes，且日志/证据不包含 raw sender ID：
 - 同一 sender 在一次 apply 中最多查询一次；触发 FloodWait 时自动等待并继续：
 - live sender lookup 瞬时失败时消息仍归档，cooldown 后的新消息会重新解析并补上 snapshot：

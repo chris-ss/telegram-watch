@@ -1937,6 +1937,57 @@ async def test_run_daemon_registers_full_archive_handler_when_enabled(
     )
 
 
+def test_full_archive_runtime_migrates_sender_only_schema_before_health_gate(
+    tmp_path: Path,
+    caplog,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    tracked = storage.connect(config.storage.db_path)
+    try:
+        storage.ensure_schema(tracked)
+    finally:
+        tracked.close()
+    archive_message = runner._archive_message_from_telegram(
+        make_archive_event_message(sender_id=999)
+    )
+    assert archive_message is not None
+    runner._persist_archive_message_to_storage(
+        config,
+        archive_message,
+        tracked_db_path=config.storage.db_path,
+    )
+    shard_path = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-05.sqlite3"
+    )
+    shard = sqlite3.connect(shard_path)
+    try:
+        shard.execute("DROP TABLE archive_senders")
+        shard.commit()
+    finally:
+        shard.close()
+
+    before = runner.inspect_archive_status(
+        config.full_archive.root_dir,
+        tracked_db_path=config.storage.db_path,
+    )
+    assert before.degraded is True
+    assert runner.only_archive_sender_schema_missing(before) is True
+
+    with caplog.at_level(logging.INFO):
+        enabled = runner._full_archive_runtime_enabled(config)
+
+    after = runner.inspect_archive_status(
+        config.full_archive.root_dir,
+        tracked_db_path=config.storage.db_path,
+    )
+    assert enabled is True
+    assert after.degraded is False
+    assert "Added archive_senders table to 1 existing full archive shard" in caplog.text
+
+
 @pytest.mark.asyncio
 async def test_run_daemon_skips_full_archive_handlers_when_archive_degraded(
     monkeypatch,
@@ -1978,6 +2029,7 @@ async def test_run_daemon_skips_full_archive_handlers_when_archive_degraded(
         "inspect_archive_status",
         lambda *_args, **_kwargs: SimpleNamespace(
             degraded=True,
+            shards=(),
             errors=("hidden shard data",),
         ),
     )

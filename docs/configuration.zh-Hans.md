@@ -197,7 +197,7 @@ L7 | **启动预热** — 启动后前几分钟限制发送速率，防止积压
 
 全量归档是可选的本地上下文层，默认关闭。开启后，tgwatch 会把指定源群组或指定 forum Topic 静默写入 `root_dir` 下独立的 SQLite manifest 和分片；现有 tracked-user 推送与报告仍继续使用原 tracked DB。
 
-实时归档还会保存本地 sender 显示快照（`display_name`、`username`、首次/最后出现时间）。这份 metadata 与消息 payload 独立，因此 tracked 消息仍然只保存 `tracked_ref`，不会在全量归档里重复保存正文或媒体元数据。
+实时归档还会保存本地 sender 显示快照（`display_name`、`username`、首次/最后出现时间）。这份 metadata 与消息 payload 独立，因此 tracked 消息仍然只保存 `tracked_ref`，不会在全量归档里重复保存正文或媒体元数据。daemon 启动时，如果旧 shard 唯一的健康问题是缺少 additive `archive_senders` 表，会先迁移再执行 live-capture 健康门禁；其他 degraded 状态仍会关闭实时归档写入。
 
 字段 | 描述 | 默认值
 ----- | ---- | ------

@@ -36,6 +36,7 @@ from .full_archive_storage import (
     find_shard_for_message,
     inspect_archive_status,
     list_archive_sender_candidates,
+    only_archive_sender_schema_missing,
     persist_archive_message,
     persist_archive_message_with_result,
     persist_archive_sender_to_shards,
@@ -900,6 +901,21 @@ def _full_archive_runtime_enabled(config: Config) -> bool:
         archive.root_dir,
         tracked_db_path=config.storage.db_path,
     )
+    if only_archive_sender_schema_missing(report):
+        try:
+            updated = ensure_archive_sender_schema(archive.root_dir)
+        except (OSError, sqlite3.Error) as exc:
+            logger.warning("Failed to migrate full archive sender schema: %s", exc)
+        else:
+            if updated:
+                logger.info(
+                    "Added archive_senders table to %s existing full archive shard(s)",
+                    updated,
+                )
+            report = inspect_archive_status(
+                archive.root_dir,
+                tracked_db_path=config.storage.db_path,
+            )
     if not report.degraded:
         return True
     logger.warning(

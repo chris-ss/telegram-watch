@@ -202,7 +202,7 @@ You may leave the defaults or point them to any writable path. The `doctor` comm
 
 Full archive is an optional local context layer. It is disabled by default. When enabled, tgwatch silently records the selected source group or selected forum Topics into separate SQLite shards under `root_dir`; existing tracked-user pushes and reports continue to use the normal tracked DB.
 
-Live archive capture also stores a local sender display snapshot (`display_name`, `username`, and first/last seen timestamps). This metadata is independent from message payload storage, so tracked messages remain `tracked_ref` rows and do not duplicate their text or media metadata in the full archive.
+Live archive capture also stores a local sender display snapshot (`display_name`, `username`, and first/last seen timestamps). This metadata is independent from message payload storage, so tracked messages remain `tracked_ref` rows and do not duplicate their text or media metadata in the full archive. On daemon startup, older shards whose only health issue is a missing additive `archive_senders` table are migrated before the live-capture health gate runs; other degraded states still disable live archive writes.
 
 Field | Description | Default
 ----- | ----------- | -------

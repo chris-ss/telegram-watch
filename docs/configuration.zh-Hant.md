@@ -197,7 +197,7 @@ L7 | **啟動預熱** — 啟動後前幾分鐘限制發送速率，防止積壓
 
 全量歸檔是可選的本機上下文層，預設關閉。啟用後，tgwatch 會把指定來源群組或指定 forum Topic 靜默寫入 `root_dir` 下獨立的 SQLite manifest 與分片；既有 tracked-user 推播與報告仍繼續使用原 tracked DB。
 
-即時歸檔也會保存本機 sender 顯示快照（`display_name`、`username`、首次/最後出現時間）。這份 metadata 與訊息 payload 分離，因此 tracked 訊息仍只保存 `tracked_ref`，不會在全量歸檔內重複保存本文或媒體 metadata。
+即時歸檔也會保存本機 sender 顯示快照（`display_name`、`username`、首次/最後出現時間）。這份 metadata 與訊息 payload 分離，因此 tracked 訊息仍只保存 `tracked_ref`，不會在全量歸檔內重複保存本文或媒體 metadata。daemon 啟動時，如果舊 shard 唯一的健康問題是缺少 additive `archive_senders` 表，會先遷移再執行 live-capture 健康門禁；其他 degraded 狀態仍會停用即時歸檔寫入。
 
 欄位 | 說明 | 預設值
 ----- | ---- | ------

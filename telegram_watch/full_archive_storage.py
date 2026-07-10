@@ -206,6 +206,21 @@ class ArchiveRepairReport:
     errors: tuple[str, ...]
 
 
+def only_archive_sender_schema_missing(report: ArchiveStatusReport) -> bool:
+    """Return whether the sender table is the archive's only health issue."""
+    expected_errors = tuple(
+        f"{shard.shard_id}: missing schema table(s): archive_senders"
+        for shard in report.shards
+        if shard.missing_schema_tables == ("archive_senders",)
+    )
+    return bool(expected_errors) and bool(
+        report.missing_shard_count == 0
+        and report.missing_index_count == 0
+        and report.missing_schema_table_count == len(expected_errors)
+        and report.errors == expected_errors
+    )
+
+
 def connect(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
@@ -349,16 +364,25 @@ def ensure_shard_schema(conn: sqlite3.Connection) -> None:
                 ON DELETE CASCADE
         );
 
+        """
+    )
+    ensure_archive_sender_table(conn)
+    ensure_shard_indexes(conn)
+
+
+def ensure_archive_sender_table(conn: sqlite3.Connection) -> None:
+    """Create only the additive sender table without repairing other schema."""
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS archive_senders (
             sender_id INTEGER PRIMARY KEY,
             username TEXT,
             display_name TEXT,
             first_seen_at TEXT NOT NULL,
             last_seen_at TEXT NOT NULL
-        );
+        )
         """
     )
-    ensure_shard_indexes(conn)
 
 
 def ensure_shard_indexes(conn: sqlite3.Connection) -> None:
@@ -621,7 +645,8 @@ def ensure_archive_sender_schema(root_dir: Path) -> int:
         try:
             if _table_exists(shard, "archive_senders"):
                 continue
-            ensure_shard_schema(shard)
+            ensure_archive_sender_table(shard)
+            shard.commit()
             updated += 1
         finally:
             shard.close()

@@ -23,6 +23,7 @@ from .full_archive_storage import (
     find_tracked_message_date,
     format_archive_sender_label,
     inspect_archive_status,
+    only_archive_sender_schema_missing,
     repair_archive_metadata,
     tracked_message_date_lookup_error,
 )
@@ -658,7 +659,7 @@ def _archive_senders_backfill_apply_preflight(config: Config) -> int:
         archive.root_dir,
         tracked_db_path=config.storage.db_path,
     )
-    if not report.degraded or _only_archive_sender_schema_is_missing(report):
+    if not report.degraded or only_archive_sender_schema_missing(report):
         return 0
 
     Console().print(
@@ -671,22 +672,6 @@ def _archive_senders_backfill_apply_preflight(config: Config) -> int:
         for error in report.errors:
             Console().print(f"- {error}")
     return 2
-
-
-def _only_archive_sender_schema_is_missing(report: ArchiveStatusReport) -> bool:
-    expected_errors = tuple(
-        f"{shard.shard_id}: missing schema table(s): archive_senders"
-        for shard in report.shards
-        if shard.missing_schema_tables == ("archive_senders",)
-    )
-    return bool(expected_errors) and bool(
-        report.missing_shard_count == 0
-        and report.missing_index_count == 0
-        and report.missing_schema_table_count == len(expected_errors)
-        and report.errors == expected_errors
-    )
-
-
 def _run_archive_status_command(config: Config) -> int:
     archive = config.full_archive
     Console().print(f"Enabled: {archive.enabled}")
