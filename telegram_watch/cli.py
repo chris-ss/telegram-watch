@@ -342,7 +342,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         ):
             logging.getLogger(__name__).warning("Run cancelled by user.")
             return 1
-        return asyncio.run(_run_daemon_command(config))
+        return asyncio.run(
+            _run_daemon_command(
+                config,
+                health_path=args.config.parent / "data" / "gui" / "run.health.json",
+            )
+        )
     elif args.command == "cleanup-replies":
         config = _load_config_or_exit(parser, args.config, command=args.command)
         return asyncio.run(
@@ -489,8 +494,8 @@ async def _run_once_command(
     return 0
 
 
-async def _run_daemon_command(config):
-    await run_daemon(config)
+async def _run_daemon_command(config, *, health_path: Path | None = None):
+    await run_daemon(config, health_path=health_path)
     return 0
 
 

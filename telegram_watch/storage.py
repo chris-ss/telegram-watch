@@ -62,8 +62,11 @@ def connect(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    # WAL mode + busy_timeout: safer for cloud-synced folders (e.g. Dropbox)
-    conn.execute("PRAGMA journal_mode = WAL")
+    # Changing journal mode takes a write lock. Query first so routine connects
+    # do not repeatedly request that lock once WAL is already persistent.
+    journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+    if journal_mode != "wal":
+        conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
