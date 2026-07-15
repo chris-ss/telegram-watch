@@ -190,11 +190,11 @@ def test_full_archive_cr_audit_documents_non_real_tg_evidence():
 
 
 def test_full_archive_release_metadata_is_prepared():
-    assert __version__ == "1.8.1"
+    assert __version__ == "1.8.0"
 
     changelog = (REPO_ROOT / "docs/CHANGELOG.md").read_text(encoding="utf-8")
     for required in (
-        "## 1.8.1",
+        "## 1.8.0 — Unreleased",
         "serializing all daemon SQLite work",
         "health heartbeat",
         "## 1.8.0",

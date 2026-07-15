@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__version__ = "1.8.1"
+__version__ = "1.8.0"
 
 from .telethon_compat import install_message_constructor_compat  # noqa: E402
 

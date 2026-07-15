@@ -4,11 +4,9 @@
 
 > 條目按時間由新到舊排列，最新版本在最上方。每條變更都會標註對應的需求編號。
 
-## 1.8.1 — 2026-07-12
+## 1.8.0 — 未發佈
 - 將守護程序的全部 SQLite 操作移出 asyncio 事件迴圈並統一序列化執行，同時避免日常連線重複切換 WAL 模式，防止永久執行時轉發鏈路卡死。
 - 新增守護程序健康心跳，GUI 現在可以區分正常執行與「PID 仍存在但事件迴圈或 SQLite 佇列已停滯」的假執行狀態。
-
-## 1.8.0 — 2026-06-02
 - 新增可選的全量訊息歸檔儲存：telegram-watch 現在可以在獨立的 SQLite manifest/shard 體系中保存整個群組或指定 Topic 的本機上下文副本，同時保持既有 tracked-user 通知與報告邏輯不變。
 - 全量歸檔中的 tracked 訊息會透過 `tracked_ref` 連回現有 tracked 資料庫，避免重複保存被追蹤訊息本文和媒體 metadata，同時保留足夠時間線資訊供後續 `archive-context` 查詢使用。
 - 新增全量歸檔維運指令：`archive-backfill`、`archive-status`、`archive-repair`、`archive-context`、`list-topics`、`archive-qa-init`，並提供預設關閉設定、降級狀態啟動攔截、修復診斷，以及 gitignored 的真實 Telegram QA 證據範本。
