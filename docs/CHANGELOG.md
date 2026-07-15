@@ -4,7 +4,7 @@
 
 > Entries are arranged from newest to oldest so the latest release notes stay at the top. Each bullet references the requirement(s) that introduced the change.
 
-## 1.8.0 — Unreleased
+## 1.8.0 — 2026-07-15
 - Prevent long-running forwarding stalls by serializing all daemon SQLite work off the asyncio event loop and avoiding redundant WAL mode changes on routine connections.
 - Add a daemon health heartbeat so the GUI can distinguish a responsive runner from a live PID with a stalled event loop or SQLite queue.
 - Add optional full-message archive storage: telegram-watch can now keep a local whole-group or selected-Topic context copy in a separate SQLite manifest/shard set while leaving tracked-user notifications and reports unchanged.
