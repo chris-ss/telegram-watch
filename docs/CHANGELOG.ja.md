@@ -4,7 +4,9 @@
 
 > 記事は新しい順に並んでいます。各項目は対応する要件番号を示します。
 
-## 1.8.0 — 2026-06-02
+## 1.8.0 — 2026-07-15
+- daemon の全 SQLite 処理を asyncio イベントループ外で直列化し、通常接続時の不要な WAL モード変更を避けることで、常時稼働中の転送停止を防止します。
+- daemon の health heartbeat を追加し、GUI が正常稼働中の runner と、PID は存在していてもイベントループまたは SQLite キューが停止した状態を区別できるようにします。
 - 任意の全量メッセージアーカイブ保存を追加。telegram-watch は既存の追跡ユーザー通知とレポートを変更せず、別個の SQLite manifest/shard 構成にグループ全体または指定 Topic のローカル文脈コピーを保存できます。
 - 全量アーカイブ内の tracked メッセージは `tracked_ref` で既存 tracked データベースへ接続し、追跡メッセージ本文とメディア metadata の重複保存を避けながら、後続の `archive-context` クエリに必要なタイムライン文脈を保持します。
 - 全量アーカイブ運用コマンドとして `archive-backfill`、`archive-status`、`archive-repair`、`archive-context`、`list-topics`、`archive-qa-init` を追加。デフォルト無効の設定、劣化状態の起動ゲート、修復診断、gitignored の実 Telegram QA 証跡テンプレートを含みます。

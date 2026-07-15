@@ -7,6 +7,8 @@ from datetime import datetime, timedelta, timezone
 import logging
 import shutil
 import sqlite3
+import threading
+import time
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 
@@ -30,6 +32,35 @@ from telegram_watch.config import (
 from telegram_watch import storage
 from telegram_watch.storage import DbMedia, DbMessage
 from telegram_watch.timeutils import utc_now
+
+
+@pytest.mark.asyncio
+async def test_async_sqlite_gate_serializes_blocking_work() -> None:
+    gate = runner._AsyncSqliteGate()
+    state_lock = threading.Lock()
+    active = 0
+    peak_active = 0
+
+    def blocking_work(value: int) -> int:
+        nonlocal active, peak_active
+        with state_lock:
+            active += 1
+            peak_active = max(peak_active, active)
+        time.sleep(0.02)
+        with state_lock:
+            active -= 1
+        return value
+
+    results = await asyncio.gather(
+        gate.run(blocking_work, 1),
+        gate.run(blocking_work, 2),
+        gate.run(blocking_work, 3),
+    )
+
+    assert results == [1, 2, 3]
+    assert peak_active == 1
+    assert gate.pending == 0
+    assert gate.pending_since is None
 
 
 def build_config(tmp_path: Path) -> Config:

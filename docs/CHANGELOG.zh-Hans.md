@@ -4,7 +4,9 @@
 
 > 条目按时间从新到旧排列，最新版本在最上方。每条变更都会标注对应的需求编号。
 
-## 1.8.0 — 2026-06-02
+## 1.8.0 — 2026-07-15
+- 将守护进程的全部 SQLite 操作移出 asyncio 事件循环并统一串行执行，同时避免日常连接重复切换 WAL 模式，防止永久运行时转发链路卡死。
+- 新增守护进程健康心跳，GUI 现在可以区分正常运行与“PID 仍存在但事件循环或 SQLite 队列已停滞”的假运行状态。
 - 新增可选的全量消息归档存储：telegram-watch 现在可以在单独的 SQLite manifest/shard 体系中保存整个群组或指定 Topic 的本地上下文副本，同时保持既有 tracked-user 通知与报告逻辑不变。
 - 全量归档中的 tracked 消息通过 `tracked_ref` 连接回现有 tracked 数据库，避免重复保存被追踪消息正文和媒体元数据，同时保留足够的时间线信息供后续 `archive-context` 查询使用。
 - 新增全量归档运维命令：`archive-backfill`、`archive-status`、`archive-repair`、`archive-context`、`list-topics`、`archive-qa-init`，并提供默认关闭配置、降级状态启动拦截、修复诊断，以及 gitignored 的真实 Telegram QA 证据模板。

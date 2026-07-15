@@ -194,6 +194,9 @@ def test_full_archive_release_metadata_is_prepared():
 
     changelog = (REPO_ROOT / "docs/CHANGELOG.md").read_text(encoding="utf-8")
     for required in (
+        "## 1.8.0 — 2026-07-15",
+        "serializing all daemon SQLite work",
+        "health heartbeat",
         "## 1.8.0",
         "full-message archive",
         "`tracked_ref`",
