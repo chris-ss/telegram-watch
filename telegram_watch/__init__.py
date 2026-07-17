@@ -4,6 +4,10 @@ from __future__ import annotations
 
 __version__ = "1.8.0"
 
+from .telethon_compat import install_message_constructor_compat  # noqa: E402
+
+install_message_constructor_compat()
+
 __all__ = [
     "__version__",
     "load_config",

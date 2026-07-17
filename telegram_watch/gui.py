@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -489,6 +490,7 @@ const _i18n = {
     checkingStatus: "Checking status...",
     running: "Running",
     runningPid: "Running (pid {pid})",
+    stalledPid: "Stalled (pid {pid})",
     notRunning: "Not running",
     runnerUnavailable: "Runner status unavailable.",
     sessionNotFound: "Session file not found. Please complete one terminal login first.",
@@ -678,6 +680,7 @@ const _i18n = {
     checkingStatus: "正在检查状态...",
     running: "运行中",
     runningPid: "运行中 (pid {pid})",
+    stalledPid: "已卡住 (pid {pid})",
     notRunning: "未运行",
     runnerUnavailable: "无法获取运行状态。",
     sessionNotFound: "未找到会话文件。请先在终端完成一次登录。",
@@ -1226,6 +1229,9 @@ function timeFormatPreview(parts) {
 const runnerStatusText = (runner) => {
   if (!runner) return t("checkingStatus");
   if (runner.running) {
+    if (runner.stalled) {
+      return runner.pid ? tf("stalledPid", {pid: runner.pid}) : t("stalledPid");
+    }
     return runner.pid ? tf("runningPid", {pid: runner.pid}) : t("running");
   }
   return t("notRunning");
@@ -2391,6 +2397,7 @@ startRunnerPolling();
 
 
 _RUN_LOG_TAIL_BYTES = 12000
+_RUN_HEALTH_STALE_SECONDS = 90.0
 
 
 class _RunnerManager:
@@ -2399,6 +2406,7 @@ class _RunnerManager:
         self.runtime_dir = config_path.parent / "data" / "gui"
         self.run_pid_path = self.runtime_dir / "run.pid"
         self.run_log_path = self.runtime_dir / "run.log"
+        self.run_health_path = self.runtime_dir / "run.health.json"
         self.once_log_path = self.runtime_dir / "once.log"
         self.lock = threading.Lock()
 
@@ -2410,9 +2418,15 @@ class _RunnerManager:
         config_ok, session_ready, retention_days, requires_retention_confirm, message = (
             self._config_health()
         )
+        health, stalled_reason = self._runner_health(pid) if running else ({}, None)
+        if stalled_reason:
+            message = f"Run daemon appears stalled (pid {pid}): {stalled_reason}"
         return {
             "running": running,
             "pid": pid,
+            "healthy": running and stalled_reason is None,
+            "stalled": stalled_reason is not None,
+            "health": health,
             "run_log": run_log,
             "once_log": once_log,
             "status": message or "",
@@ -2442,6 +2456,7 @@ class _RunnerManager:
                     ),
                 }
             self._ensure_runtime_dir()
+            self.run_health_path.unlink(missing_ok=True)
             self._write_log_header(self.run_log_path, "Starting run daemon.")
             proc = self._spawn_process(
                 [
@@ -2465,6 +2480,7 @@ class _RunnerManager:
             if not self._terminate_run_process(pid):
                 return {"ok": False, "status": f"Failed to stop run daemon (pid {pid})."}
             self.run_pid_path.unlink(missing_ok=True)
+            self.run_health_path.unlink(missing_ok=True)
             self._write_log_header(self.run_log_path, f"Stopped run daemon (pid {pid}).")
             return {"ok": True, "status": f"Run stopped (pid {pid})."}
 
@@ -2524,7 +2540,58 @@ class _RunnerManager:
         if self._pid_is_running(pid):
             logger.warning("Ignoring PID %s from run.pid because it does not match tgwatch run daemon.", pid)
         self.run_pid_path.unlink(missing_ok=True)
+        self.run_health_path.unlink(missing_ok=True)
         return False, None
+
+    def _runner_health(
+        self,
+        pid: int | None,
+    ) -> tuple[dict[str, Any], str | None]:
+        if pid is None:
+            return {}, None
+        try:
+            raw = json.loads(self.run_health_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            try:
+                pid_age = time.time() - self.run_pid_path.stat().st_mtime
+            except OSError:
+                pid_age = 0.0
+            if pid_age > _RUN_HEALTH_STALE_SECONDS:
+                return {}, "health heartbeat is missing"
+            return {}, None
+        if not isinstance(raw, dict) or raw.get("pid") != pid:
+            return {}, "health heartbeat belongs to a different process"
+        last_tick = self._parse_health_timestamp(raw.get("last_tick"))
+        if last_tick is None:
+            return raw, "health heartbeat timestamp is invalid"
+        tick_age = (datetime.now(timezone.utc) - last_tick).total_seconds()
+        if tick_age > _RUN_HEALTH_STALE_SECONDS:
+            return raw, f"event-loop heartbeat is {int(tick_age)}s old"
+        pending = raw.get("sqlite_pending")
+        pending_since = self._parse_health_timestamp(raw.get("sqlite_pending_since"))
+        if isinstance(pending, int) and pending > 0 and pending_since is not None:
+            last_success = self._parse_health_timestamp(raw.get("sqlite_last_success"))
+            last_progress = max(
+                timestamp
+                for timestamp in (pending_since, last_success)
+                if timestamp is not None
+            )
+            pending_age = (datetime.now(timezone.utc) - last_progress).total_seconds()
+            if pending_age > _RUN_HEALTH_STALE_SECONDS:
+                return raw, f"SQLite made no progress for {int(pending_age)}s"
+        return raw, None
+
+    @staticmethod
+    def _parse_health_timestamp(value: Any) -> datetime | None:
+        if not isinstance(value, str) or not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
 
     def _read_pid(self) -> int | None:
         if not self.run_pid_path.exists():

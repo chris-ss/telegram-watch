@@ -194,11 +194,17 @@ def test_full_archive_release_metadata_is_prepared():
 
     changelog = (REPO_ROOT / "docs/CHANGELOG.md").read_text(encoding="utf-8")
     for required in (
+        "## 1.8.0 — 2026-07-15",
+        "serializing all daemon SQLite work",
+        "health heartbeat",
         "## 1.8.0",
         "full-message archive",
         "`tracked_ref`",
         "`archive-context`",
         "`archive-qa-init`",
+        "Reconnect the configured sender account",
+        "falling back to the primary account",
+        "control-chat warning",
     ):
         assert required in changelog
 

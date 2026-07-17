@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -157,6 +159,71 @@ def test_stop_run_failure(monkeypatch, tmp_path: Path) -> None:
     assert payload["ok"] is False
     assert "Failed to stop run daemon" in payload["status"]
     assert manager.run_pid_path.exists()
+
+
+def test_status_payload_marks_stale_event_loop_heartbeat_as_stalled(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    manager = _manager(tmp_path)
+    manager._ensure_runtime_dir()
+    stale_tick = datetime.now(timezone.utc) - timedelta(minutes=2)
+    manager.run_health_path.write_text(
+        json.dumps(
+            {
+                "pid": 12345,
+                "last_tick": stale_tick.isoformat(),
+                "sqlite_pending": 0,
+                "sqlite_pending_since": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(manager, "_current_run", lambda: (True, 12345))
+    monkeypatch.setattr(
+        manager,
+        "_config_health",
+        lambda: (True, True, 30, False, None),
+    )
+
+    payload = manager.status_payload()
+
+    assert payload["running"] is True
+    assert payload["healthy"] is False
+    assert payload["stalled"] is True
+    assert "event-loop heartbeat" in payload["status"]
+
+
+def test_status_payload_marks_long_sqlite_queue_as_stalled(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    manager = _manager(tmp_path)
+    manager._ensure_runtime_dir()
+    now = datetime.now(timezone.utc)
+    manager.run_health_path.write_text(
+        json.dumps(
+            {
+                "pid": 12345,
+                "last_tick": now.isoformat(),
+                "sqlite_pending": 1,
+                "sqlite_pending_since": (now - timedelta(minutes=2)).isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(manager, "_current_run", lambda: (True, 12345))
+    monkeypatch.setattr(
+        manager,
+        "_config_health",
+        lambda: (True, True, 30, False, None),
+    )
+
+    payload = manager.status_payload()
+
+    assert payload["healthy"] is False
+    assert payload["stalled"] is True
+    assert "SQLite made no progress" in payload["status"]
 
 
 def test_current_run_clears_pid_when_process_identity_mismatch(monkeypatch, tmp_path: Path) -> None:

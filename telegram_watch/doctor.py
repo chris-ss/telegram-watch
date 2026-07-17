@@ -13,6 +13,11 @@ from .config import Config
 from .full_archive_storage import connect as connect_archive
 from .full_archive_storage import ensure_manifest_schema
 from .storage import db_session
+from .telethon_compat import (
+    SUPPORTED_TELETHON_LAYER,
+    SUPPORTED_TELETHON_VERSION,
+    telethon_runtime_problem,
+)
 
 
 @dataclass
@@ -28,6 +33,7 @@ def run_doctor(config: Config) -> None:
     console = Console()
     checks: list[CheckResult] = []
     checks.append(CheckResult("config", True, "config parsed successfully"))
+    checks.append(_check_telethon_runtime())
 
     checks.extend(
         [
@@ -73,6 +79,17 @@ def _check_dir(label: str, path: Path) -> CheckResult:
     except OSError as exc:
         return CheckResult(label, False, f"cannot create or write {path}: {exc}")
     return CheckResult(label, True, f"{path}")
+
+
+def _check_telethon_runtime() -> CheckResult:
+    problem = telethon_runtime_problem()
+    if problem is not None:
+        return CheckResult("Telethon runtime", False, problem)
+    return CheckResult(
+        "Telethon runtime",
+        True,
+        f"{SUPPORTED_TELETHON_VERSION} (layer {SUPPORTED_TELETHON_LAYER})",
+    )
 
 
 def _probe_dir_writable(path: Path) -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import shutil
@@ -15,7 +16,7 @@ from html import escape
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Sequence, TypeVar
 
-from telethon import TelegramClient, events, errors, functions
+from telethon import TelegramClient, events, errors, functions, utils
 from telethon.sessions import SQLiteSession
 from telethon.tl.custom import message as custom_message
 
@@ -28,12 +29,18 @@ from .config import (
 from .full_archive_storage import (
     ArchiveMedia,
     ArchiveMessage,
+    ArchiveSender,
+    ArchiveSenderCandidate,
     archive_message_exists,
     connect as archive_connect,
+    ensure_archive_sender_schema,
     find_shard_for_message,
     inspect_archive_status,
+    list_archive_sender_candidates,
+    only_archive_sender_schema_missing,
     persist_archive_message,
     persist_archive_message_with_result,
+    persist_archive_sender_to_shards,
     record_tracked_db_link,
     record_shard_write,
     select_shard,
@@ -58,9 +65,103 @@ from .timeutils import parse_since_spec, utc_now
 
 logger = logging.getLogger(__name__)
 
+_SENDER_FALLBACK_ALERT = (
+    "\u26a0\ufe0f Sender account is unavailable after reconnect retry; "
+    "using the primary account for outgoing control messages. "
+    "Check the sender session and restart the daemon if this persists."
+)
+
 ARCHIVE_BACKFILL_WAIT_THRESHOLD = 1_000
 ARCHIVE_BACKFILL_WAIT_TIME_SECONDS = 1.0
 ARCHIVE_RELINK_SHUTDOWN_TIMEOUT_SECONDS = 5.0
+ARCHIVE_SENDER_LOOKUP_RETRY_SECONDS = 60.0
+RUNNER_HEALTH_INTERVAL_SECONDS = 15.0
+
+
+class _AsyncSqliteGate:
+    """Serialize daemon SQLite work and keep blocking calls off the event loop."""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self.pending = 0
+        self.pending_since: datetime | None = None
+        self.last_success_at = utc_now()
+
+    async def run(
+        self,
+        func: Callable[..., Any],
+        /,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        self.pending += 1
+        if self.pending_since is None:
+            self.pending_since = utc_now()
+        try:
+            async with self._lock:
+                result = await asyncio.to_thread(func, *args, **kwargs)
+                self.last_success_at = utc_now()
+                return result
+        finally:
+            self.pending -= 1
+            if self.pending == 0:
+                self.pending_since = None
+
+
+class _RunnerHealthLoop:
+    """Write a liveness heartbeat that the GUI can validate independently of PID."""
+
+    def __init__(
+        self,
+        path: Path,
+        sqlite_gate: _AsyncSqliteGate,
+        *,
+        interval_seconds: float = RUNNER_HEALTH_INTERVAL_SECONDS,
+    ) -> None:
+        self.path = path
+        self.sqlite_gate = sqlite_gate
+        self.interval_seconds = interval_seconds
+        self.started_at = utc_now()
+        self._task: asyncio.Task[None] | None = None
+
+    def start(self) -> None:
+        self._write()
+        self._task = asyncio.create_task(self._run())
+
+    async def stop(self) -> None:
+        if self._task is None:
+            return
+        self._task.cancel()
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            pass
+
+    async def _run(self) -> None:
+        while True:
+            await asyncio.sleep(self.interval_seconds)
+            self._write()
+
+    def _write(self) -> None:
+        payload = {
+            "pid": os.getpid(),
+            "started_at": self.started_at.isoformat(),
+            "last_tick": utc_now().isoformat(),
+            "sqlite_pending": self.sqlite_gate.pending,
+            "sqlite_pending_since": (
+                self.sqlite_gate.pending_since.isoformat()
+                if self.sqlite_gate.pending_since is not None
+                else None
+            ),
+            "sqlite_last_success": self.sqlite_gate.last_success_at.isoformat(),
+        }
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = self.path.with_suffix(self.path.suffix + ".tmp")
+        temp_path.write_text(
+            json.dumps(payload, ensure_ascii=True, sort_keys=True),
+            encoding="utf-8",
+        )
+        temp_path.replace(self.path)
 
 
 @dataclass
@@ -85,6 +186,25 @@ class ArchiveBackfillStats:
     linked: int = 0
     updated: int = 0
     dry_run: bool = True
+
+
+@dataclass
+class ArchiveSenderBackfillStats:
+    candidates: int = 0
+    schema_updates: int = 0
+    reused: int = 0
+    cached: int = 0
+    fetched: int = 0
+    unresolved: int = 0
+    written_senders: int = 0
+    shard_writes: int = 0
+    dry_run: bool = True
+
+
+@dataclass(frozen=True)
+class _ArchiveSenderIdentity:
+    username: str | None
+    display_name: str | None
 
 
 @dataclass(frozen=True)
@@ -171,6 +291,25 @@ class _WalSqliteSession(SQLiteSession):
             self._wal_set = True
         return c
 
+    def get_cached_sender_identity(
+        self,
+        sender_id: int,
+    ) -> _ArchiveSenderIdentity | None:
+        row = self._execute(
+            "SELECT username, name FROM entities WHERE id = ?",
+            sender_id,
+        )
+        if row is None:
+            return None
+        username = _normalize_sender_username(row[0])
+        display_name = _normalize_sender_text(row[1])
+        if not username and not display_name:
+            return None
+        return _ArchiveSenderIdentity(
+            username=username,
+            display_name=display_name,
+        )
+
 
 def _resolve_once_targets(config: Config, selector: str | None) -> tuple[TargetGroupConfig, ...]:
     if not selector:
@@ -249,45 +388,30 @@ async def run_once(
         report_paths.append(report_path)
     if push:
         sender_client = await _start_sender_client(config)
-        send_client = sender_client
-        sender_active = sender_client is not None
-        if send_client is None:
+        fallback_client: TelegramClient | None = None
+        if sender_client is None:
             send_client = _build_client(config)
             await _start_client(send_client, "primary")
+        else:
+            send_client = sender_client
+            fallback_client = _build_client(config)
+            await _start_client(fallback_client, "primary")
         try:
-                await _push_once_reports(
-                    send_client,
-                    config,
-                    targets,
-                    stored_by_target,
-                    since,
-                    until,
-                    report_paths,
+            await _push_once_reports(
+                send_client,
+                config,
+                targets,
+                stored_by_target,
+                since,
+                until,
+                report_paths,
                 bark_context=(f"(since {since_label})" if since_label else None),
+                fallback_client=fallback_client,
             )
-        except Exception:
-            if sender_active:
-                logger.warning("Sender account failed; retrying report push with primary account.")
-                await send_client.disconnect()
-                primary = _build_client(config)
-                await primary.start()
-                try:
-                        await _push_once_reports(
-                            primary,
-                            config,
-                            targets,
-                            stored_by_target,
-                            since,
-                            until,
-                            report_paths,
-                        bark_context=(f"(since {since_label})" if since_label else None),
-                    )
-                finally:
-                    await primary.disconnect()
-                return report_paths
-            raise
         finally:
             await send_client.disconnect()
+            if fallback_client is not None:
+                await fallback_client.disconnect()
     return report_paths
 
 
@@ -445,6 +569,121 @@ async def run_archive_backfill(
     return stats
 
 
+async def run_archive_senders_backfill(
+    config: Config,
+    *,
+    limit: int | None = None,
+    apply: bool = False,
+) -> ArchiveSenderBackfillStats:
+    """Resolve missing full-archive sender snapshots without exposing IDs."""
+    archive = config.full_archive
+    if not archive.enabled or archive.source_chat_id is None:
+        raise ValueError(
+            "full_archive must be enabled before running archive-senders-backfill"
+        )
+    if limit is not None and limit < 0:
+        raise ValueError("archive-senders-backfill limit must be >= 0")
+    if limit == 0:
+        return ArchiveSenderBackfillStats(dry_run=not apply)
+
+    schema_updates = 0
+    if apply:
+        schema_updates = await asyncio.to_thread(
+            ensure_archive_sender_schema,
+            archive.root_dir,
+        )
+    candidates = list_archive_sender_candidates(archive.root_dir, limit=limit)
+    stats = ArchiveSenderBackfillStats(
+        candidates=len(candidates),
+        schema_updates=schema_updates,
+        dry_run=not apply,
+    )
+    if not apply or not candidates:
+        return stats
+
+    unresolved_candidates: list[ArchiveSenderCandidate] = []
+    for candidate in candidates:
+        if candidate.existing_sender is None:
+            unresolved_candidates.append(candidate)
+            continue
+        stats.reused += 1
+        stats.shard_writes += await asyncio.to_thread(
+            persist_archive_sender_to_shards,
+            candidate.existing_sender,
+            candidate.shard_paths,
+        )
+        stats.written_senders += 1
+    if not unresolved_candidates:
+        return stats
+
+    client = _build_client(config)
+    await _start_client(client, "primary")
+    try:
+        cached_lookup = getattr(client.session, "get_cached_sender_identity", None)
+        for candidate in unresolved_candidates:
+            identity = (
+                cached_lookup(candidate.sender_id)
+                if callable(cached_lookup)
+                else None
+            )
+            if identity is not None:
+                stats.cached += 1
+            else:
+                identity = await _fetch_archive_sender_identity(client, candidate)
+                if identity is not None:
+                    stats.fetched += 1
+            if identity is None:
+                stats.unresolved += 1
+                continue
+            snapshot = _archive_sender_from_identity(candidate, identity)
+
+            stats.shard_writes += await asyncio.to_thread(
+                persist_archive_sender_to_shards,
+                snapshot,
+                candidate.shard_paths,
+            )
+            stats.written_senders += 1
+    finally:
+        await client.disconnect()
+    return stats
+
+
+async def _fetch_archive_sender_identity(
+    client: TelegramClient,
+    candidate: ArchiveSenderCandidate,
+) -> _ArchiveSenderIdentity | None:
+    try:
+        message = await _with_floodwait(
+            client.get_messages,
+            candidate.chat_id,
+            ids=candidate.message_id,
+        )
+        if isinstance(message, (list, tuple)):
+            message = message[0] if message else None
+        if message is None:
+            return None
+        get_sender = getattr(message, "get_sender", None)
+        if not callable(get_sender):
+            return _sender_identity_from_entity(getattr(message, "sender", None))
+        entity = await _with_floodwait(get_sender)
+        return _sender_identity_from_entity(entity)
+    except (errors.RPCError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def _archive_sender_from_identity(
+    candidate: ArchiveSenderCandidate,
+    identity: _ArchiveSenderIdentity,
+) -> ArchiveSender:
+    return ArchiveSender(
+        sender_id=candidate.sender_id,
+        username=identity.username,
+        display_name=identity.display_name,
+        first_seen_at=candidate.first_seen_at,
+        last_seen_at=candidate.last_seen_at,
+    )
+
+
 async def run_list_topics(
     config: Config,
     *,
@@ -584,7 +823,11 @@ async def _send_reconnect_notification(
         logger.warning("Failed to send reconnect notification: %s", notify_exc)
 
 
-async def run_daemon(config: Config) -> None:
+async def run_daemon(
+    config: Config,
+    *,
+    health_path: Path | None = None,
+) -> None:
     """Run watcher daemon."""
     _purge_old_reports(
         config.reporting.reports_dir,
@@ -599,6 +842,12 @@ async def run_daemon(config: Config) -> None:
     me = await client.get_me()
     self_user_id = int(me.id)
     logger.info("Logged in as %s", getattr(me, "username", self_user_id))
+    sqlite_gate = _AsyncSqliteGate()
+    health_loop = (
+        _RunnerHealthLoop(health_path, sqlite_gate)
+        if health_path is not None
+        else None
+    )
 
     is_realtime = config.realtime.push_mode == "realtime"
     realtime_pusher: _RealtimePusher | None = None
@@ -637,6 +886,7 @@ async def run_daemon(config: Config) -> None:
             activity_tracker,
             fallback_client=fallback_client,
             html_only=is_realtime,
+            sqlite_gate=sqlite_gate,
             interval_override_minutes=(
                 config.realtime.report_interval_minutes if is_realtime else None
             ),
@@ -663,6 +913,7 @@ async def run_daemon(config: Config) -> None:
         self_user_id,
         activity_tracker,
         fallback_client=fallback_client,
+        sqlite_gate=sqlite_gate,
     )
 
     archive_runtime_enabled = _full_archive_runtime_enabled(config)
@@ -674,6 +925,7 @@ async def run_daemon(config: Config) -> None:
             target,
             realtime_queue=realtime_pusher.queue if realtime_pusher else None,
             archive_relink_enabled=archive_runtime_enabled,
+            sqlite_gate=sqlite_gate,
         )
         target_handlers.append(target_handler)
         client.add_event_handler(
@@ -681,7 +933,7 @@ async def run_daemon(config: Config) -> None:
             events.NewMessage(chats=[target.target_chat_id]),
         )
     if archive_runtime_enabled:
-        full_archive_handler = _FullArchiveHandler(config)
+        full_archive_handler = _FullArchiveHandler(config, sqlite_gate=sqlite_gate)
         client.add_event_handler(
             full_archive_handler.handle,
             events.NewMessage(chats=[config.full_archive.source_chat_id]),
@@ -719,6 +971,8 @@ async def run_daemon(config: Config) -> None:
         heartbeat_loop.start()
     if update_check_loop is not None:
         update_check_loop.start()
+    if health_loop is not None:
+        health_loop.start()
     try:
         await _run_with_reconnect(client, send_client, config, fallback_client=fallback_client)
     except Exception as exc:
@@ -731,6 +985,8 @@ async def run_daemon(config: Config) -> None:
             await heartbeat_loop.stop()
         if update_check_loop is not None:
             await update_check_loop.stop()
+        if health_loop is not None:
+            await health_loop.stop()
         for loop in summary_loops:
             await loop.stop()
         if target_handlers:
@@ -750,6 +1006,21 @@ def _full_archive_runtime_enabled(config: Config) -> bool:
         archive.root_dir,
         tracked_db_path=config.storage.db_path,
     )
+    if only_archive_sender_schema_missing(report):
+        try:
+            updated = ensure_archive_sender_schema(archive.root_dir)
+        except (OSError, sqlite3.Error) as exc:
+            logger.warning("Failed to migrate full archive sender schema: %s", exc)
+        else:
+            if updated:
+                logger.info(
+                    "Added archive_senders table to %s existing full archive shard(s)",
+                    updated,
+                )
+            report = inspect_archive_status(
+                archive.root_dir,
+                tracked_db_path=config.storage.db_path,
+            )
     if not report.degraded:
         return True
     logger.warning(
@@ -974,6 +1245,7 @@ class _TargetHandler:
         *,
         realtime_queue: "asyncio.Queue[tuple[DbMessage, TargetGroupConfig]] | None" = None,
         archive_relink_enabled: bool = True,
+        sqlite_gate: _AsyncSqliteGate | None = None,
     ):
         self.config = config
         self.client = client
@@ -981,6 +1253,7 @@ class _TargetHandler:
         self._tracked = set(target.tracked_user_ids)
         self._realtime_queue = realtime_queue
         self._archive_relink_enabled = archive_relink_enabled
+        self._sqlite_gate = sqlite_gate or _AsyncSqliteGate()
         self._archive_relink_tasks: set[asyncio.Task[None]] = set()
 
     async def drain_archive_relinks(
@@ -1028,41 +1301,70 @@ class _TargetHandler:
         if not capture:
             return
         message, media = capture
-        with db_session(self.config.storage.db_path) as conn:
-            persist_message(conn, message, media)
+        db_msg = await self._sqlite_gate.run(
+            _persist_tracked_message,
+            self.config.storage.db_path,
+            message,
+            media,
+            include_realtime=self._realtime_queue is not None,
+        )
         if self._archive_relink_enabled:
             _schedule_archive_relink_after_tracked_persist(
                 self.config,
                 msg,
                 message,
                 task_set=self._archive_relink_tasks,
+                sqlite_gate=self._sqlite_gate,
             )
         logger.info(
             "Captured message %s from %s",
             message.message_id,
             self.config.describe_user(int(message.sender_id), target=self.target),
         )
-        if self._realtime_queue is not None:
-            # Re-read the persisted message so media list is populated from DB.
-            with db_session(self.config.storage.db_path) as conn:
-                db_msgs = fetch_messages_between(
-                    conn,
-                    (int(message.sender_id),),
-                    message.date - timedelta(seconds=1),
-                    message.date + timedelta(seconds=1),
-                    chat_ids=[message.chat_id],
-                )
-            db_msg = next(
-                (m for m in db_msgs if m.message_id == message.message_id),
-                None,
-            )
-            if db_msg is not None:
-                self._realtime_queue.put_nowait((db_msg, self.target))
+        if self._realtime_queue is not None and db_msg is not None:
+            self._realtime_queue.put_nowait((db_msg, self.target))
+
+
+def _persist_tracked_message(
+    db_path: Path,
+    message: StoredMessage,
+    media: Sequence[StoredMedia],
+    *,
+    include_realtime: bool,
+) -> DbMessage | None:
+    """Persist a tracked message and optionally return its media-populated DB row."""
+    with db_session(db_path) as conn:
+        persist_message(conn, message, media)
+        if not include_realtime:
+            return None
+        db_messages = fetch_messages_between(
+            conn,
+            (int(message.sender_id),),
+            message.date - timedelta(seconds=1),
+            message.date + timedelta(seconds=1),
+            chat_ids=[message.chat_id],
+        )
+    return next(
+        (item for item in db_messages if item.message_id == message.message_id),
+        None,
+    )
 
 
 class _FullArchiveHandler:
-    def __init__(self, config: Config):
+    def __init__(
+        self,
+        config: Config,
+        *,
+        sqlite_gate: _AsyncSqliteGate | None = None,
+    ):
         self.config = config
+        self._sqlite_gate = sqlite_gate or _AsyncSqliteGate()
+        self._sender_identity_cache: dict[int, _ArchiveSenderIdentity] = {}
+        self._sender_lookup_retry_after: dict[int, float] = {}
+        self._sender_lookup_tasks: dict[
+            int,
+            asyncio.Task[_ArchiveSenderIdentity | None],
+        ] = {}
 
     async def handle(self, event: events.NewMessage.Event) -> None:
         try:
@@ -1075,11 +1377,13 @@ class _FullArchiveHandler:
                 message,
             ):
                 return
-            await asyncio.to_thread(
+            sender_snapshot = await self._sender_snapshot(event, message)
+            await self._sqlite_gate.run(
                 _persist_archive_message_to_storage,
                 self.config,
                 message,
                 tracked_db_path=self.config.storage.db_path,
+                sender_snapshot=sender_snapshot,
             )
         except Exception as exc:
             logger.warning(
@@ -1088,6 +1392,83 @@ class _FullArchiveHandler:
                 exc_info=True,
             )
 
+    async def _sender_snapshot(
+        self,
+        event: events.NewMessage.Event,
+        message: ArchiveMessage,
+    ) -> ArchiveSender | None:
+        if message.sender_id is None:
+            return None
+        identity = await self._sender_identity(event, message.sender_id)
+        if identity is None:
+            return None
+        return ArchiveSender(
+            sender_id=message.sender_id,
+            username=identity.username,
+            display_name=identity.display_name,
+            first_seen_at=message.date,
+            last_seen_at=message.date,
+        )
+
+    async def _sender_identity(
+        self,
+        event: events.NewMessage.Event,
+        sender_id: int,
+    ) -> _ArchiveSenderIdentity | None:
+        if sender_id in self._sender_identity_cache:
+            return self._sender_identity_cache[sender_id]
+        loop = asyncio.get_running_loop()
+        retry_after = self._sender_lookup_retry_after.get(sender_id)
+        if retry_after is not None and loop.time() < retry_after:
+            return None
+        task = self._sender_lookup_tasks.get(sender_id)
+        if task is None:
+            task = asyncio.create_task(self._load_sender_identity(event))
+            self._sender_lookup_tasks[sender_id] = task
+        try:
+            identity = await task
+        except errors.FloodWaitError as exc:
+            wait_for = max(
+                ARCHIVE_SENDER_LOOKUP_RETRY_SECONDS,
+                float(exc.seconds + 1),
+            )
+            self._sender_lookup_retry_after[sender_id] = loop.time() + wait_for
+            logger.warning(
+                "FloodWait during full archive sender lookup; retrying after %ss",
+                wait_for,
+            )
+            return None
+        finally:
+            self._sender_lookup_tasks.pop(sender_id, None)
+        if identity is None:
+            self._sender_lookup_retry_after[sender_id] = (
+                loop.time() + ARCHIVE_SENDER_LOOKUP_RETRY_SECONDS
+            )
+            return None
+        self._sender_lookup_retry_after.pop(sender_id, None)
+        self._sender_identity_cache[sender_id] = identity
+        return identity
+
+    async def _load_sender_identity(
+        self,
+        event: events.NewMessage.Event,
+    ) -> _ArchiveSenderIdentity | None:
+        get_sender = getattr(event, "get_sender", None)
+        if not callable(get_sender):
+            get_sender = getattr(event.message, "get_sender", None)
+        try:
+            if callable(get_sender):
+                entity = get_sender()
+                if hasattr(entity, "__await__"):
+                    entity = await entity
+            else:
+                entity = getattr(event.message, "sender", None)
+            return _sender_identity_from_entity(entity)
+        except errors.FloodWaitError:
+            raise
+        except Exception:
+            return None
+
 
 def _schedule_archive_relink_after_tracked_persist(
     config: Config,
@@ -1095,6 +1476,7 @@ def _schedule_archive_relink_after_tracked_persist(
     stored_message: StoredMessage,
     *,
     task_set: set[asyncio.Task[None]] | None = None,
+    sqlite_gate: _AsyncSqliteGate | None = None,
 ) -> asyncio.Task[None] | None:
     if not config.full_archive.enabled:
         return None
@@ -1103,6 +1485,7 @@ def _schedule_archive_relink_after_tracked_persist(
             config,
             telegram_message,
             stored_message,
+            sqlite_gate=sqlite_gate,
         )
     )
     if task_set is not None:
@@ -1115,6 +1498,8 @@ async def _relink_archive_message_after_tracked_persist(
     config: Config,
     telegram_message: custom_message.Message,
     stored_message: StoredMessage,
+    *,
+    sqlite_gate: _AsyncSqliteGate | None = None,
 ) -> None:
     if not config.full_archive.enabled:
         return
@@ -1128,7 +1513,8 @@ async def _relink_archive_message_after_tracked_persist(
             archive_message,
         ):
             return
-        await asyncio.to_thread(
+        gate = sqlite_gate or _AsyncSqliteGate()
+        await gate.run(
             _persist_archive_message_to_storage,
             config,
             archive_message,
@@ -1224,6 +1610,7 @@ def _persist_archive_message_to_storage(
     message: ArchiveMessage,
     *,
     tracked_db_path: Path | None,
+    sender_snapshot: ArchiveSender | None = None,
 ) -> ArchivePersistResult:
     archive = config.full_archive
     manifest_path = archive.root_dir / "manifest.sqlite3"
@@ -1268,6 +1655,7 @@ def _persist_archive_message_to_storage(
                 message,
                 tracked_db_path=tracked_db_path,
                 archive_root_dir=archive.root_dir,
+                sender=sender_snapshot,
             )
             payload_mode = persist_result.payload_mode
         finally:
@@ -1350,6 +1738,34 @@ def _coerce_optional_int(value: object) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _sender_identity_from_entity(entity: object) -> _ArchiveSenderIdentity | None:
+    if entity is None:
+        return None
+    username = _normalize_sender_username(getattr(entity, "username", None))
+    display_name = _normalize_sender_text(utils.get_display_name(entity))
+    if not username and not display_name:
+        return None
+    return _ArchiveSenderIdentity(
+        username=username,
+        display_name=display_name,
+    )
+
+
+def _normalize_sender_text(value: object) -> str | None:
+    if value is None:
+        return None
+    normalized = " ".join(str(value).split())
+    return normalized or None
+
+
+def _normalize_sender_username(value: object) -> str | None:
+    normalized = _normalize_sender_text(value)
+    if normalized is None:
+        return None
+    normalized = normalized.lstrip("@").strip()
+    return normalized or None
 
 
 def _coerce_optional_datetime(value: object) -> datetime | None:
@@ -1538,6 +1954,7 @@ class _ControlHandler:
         tracker: "_ActivityTracker",
         *,
         fallback_client: TelegramClient | None = None,
+        sqlite_gate: _AsyncSqliteGate | None = None,
     ):
         self.config = config
         self.client = client
@@ -1545,6 +1962,7 @@ class _ControlHandler:
         self.owner_id = owner_id
         self._tracker = tracker
         self._fallback_client = fallback_client
+        self._sqlite_gate = sqlite_gate or _AsyncSqliteGate()
 
     async def handle(self, event: events.NewMessage.Event) -> None:
         if int(getattr(event.message, "sender_id", 0)) != self.owner_id:
@@ -1619,8 +2037,13 @@ class _ControlHandler:
             await _reply(event, "Limit must be > 0.", client=self.send_client, fallback_client=self._fallback_client)
             return
         chat_ids = [target.target_chat_id for target in targets]
-        with db_session(self.config.storage.db_path) as conn:
-            messages = fetch_recent_messages(conn, user_id, limit, chat_ids=chat_ids)
+        messages = await self._sqlite_gate.run(
+            _fetch_recent_messages_from_storage,
+            self.config.storage.db_path,
+            user_id,
+            limit,
+            chat_ids,
+        )
         if not messages:
             await _reply(event, "No messages stored yet.", client=self.send_client, fallback_client=self._fallback_client)
             return
@@ -1647,13 +2070,13 @@ class _ControlHandler:
             await _reply(event, str(exc), client=self.send_client, fallback_client=self._fallback_client)
             return
         chat_ids = [target.target_chat_id for target in targets]
-        with db_session(self.config.storage.db_path) as conn:
-            counts = fetch_summary_counts(
-                conn,
-                _tracked_ids_for_targets(targets),
-                since,
-                chat_ids=chat_ids,
-            )
+        counts = await self._sqlite_gate.run(
+            _fetch_summary_counts_from_storage,
+            self.config.storage.db_path,
+            _tracked_ids_for_targets(targets),
+            since,
+            chat_ids,
+        )
         if not counts:
             await _reply(event, "No messages in that window.", client=self.send_client, fallback_client=self._fallback_client)
             return
@@ -1681,28 +2104,28 @@ class _ControlHandler:
             await _reply(event, str(exc), client=self.send_client, fallback_client=self._fallback_client)
             return
         until = utc_now()
-        with db_session(self.config.storage.db_path) as conn:
-            for target in targets:
-                messages = fetch_messages_between(
-                    conn,
-                    target.tracked_user_ids,
-                    since,
-                    until,
-                    chat_ids=[target.target_chat_id],
-                )
-                report = generate_report(messages, self.config, since, until, target=target)
-                await _send_report_bundle(
-                    self.send_client,
-                    self.config,
-                    control,
-                    target,
-                    messages,
-                    since,
-                    until,
-                    report,
-                    tracker=self._tracker,
-                    fallback_client=self._fallback_client,
-                )
+        for target in targets:
+            messages = await self._sqlite_gate.run(
+                _fetch_messages_from_storage,
+                self.config.storage.db_path,
+                target.tracked_user_ids,
+                since,
+                until,
+                [target.target_chat_id],
+            )
+            report = generate_report(messages, self.config, since, until, target=target)
+            await _send_report_bundle(
+                self.send_client,
+                self.config,
+                control,
+                target,
+                messages,
+                since,
+                until,
+                report,
+                tracker=self._tracker,
+                fallback_client=self._fallback_client,
+            )
 
     async def _resolve_user(self, arg: str) -> int:
         arg = arg.strip()
@@ -1713,6 +2136,43 @@ class _ControlHandler:
         if user_id is None:
             raise ValueError("Cannot resolve user")
         return int(user_id)
+
+
+def _fetch_recent_messages_from_storage(
+    db_path: Path,
+    user_id: int,
+    limit: int,
+    chat_ids: Sequence[int],
+) -> list[DbMessage]:
+    with db_session(db_path) as conn:
+        return fetch_recent_messages(conn, user_id, limit, chat_ids=chat_ids)
+
+
+def _fetch_summary_counts_from_storage(
+    db_path: Path,
+    tracked_ids: Sequence[int],
+    since: datetime,
+    chat_ids: Sequence[int],
+) -> dict[int, int]:
+    with db_session(db_path) as conn:
+        return fetch_summary_counts(conn, tracked_ids, since, chat_ids=chat_ids)
+
+
+def _fetch_messages_from_storage(
+    db_path: Path,
+    tracked_ids: Sequence[int],
+    since: datetime,
+    until: datetime,
+    chat_ids: Sequence[int],
+) -> list[DbMessage]:
+    with db_session(db_path) as conn:
+        return fetch_messages_between(
+            conn,
+            tracked_ids,
+            since,
+            until,
+            chat_ids=chat_ids,
+        )
 
 
 def _format_message_line(msg: DbMessage) -> str:
@@ -1760,6 +2220,7 @@ class _SummaryLoop:
         *,
         fallback_client: TelegramClient | None = None,
         html_only: bool = False,
+        sqlite_gate: _AsyncSqliteGate | None = None,
         interval_override_minutes: int | None = None,
     ):
         self.config = config
@@ -1772,6 +2233,7 @@ class _SummaryLoop:
         self._tracker = tracker
         self._fallback_client = fallback_client
         self._html_only = html_only
+        self._sqlite_gate = sqlite_gate or _AsyncSqliteGate()
         self._interval_minutes = interval_override_minutes or target.summary_interval_minutes
 
     def start(self) -> None:
@@ -1810,14 +2272,14 @@ class _SummaryLoop:
         now = utc_now()
         since = self._last_summary
         self._last_summary = now
-        with db_session(self.config.storage.db_path) as conn:
-            messages = fetch_messages_between(
-                conn,
-                self.target.tracked_user_ids,
-                since,
-                now,
-                chat_ids=[self.target.target_chat_id],
-            )
+        messages = await self._sqlite_gate.run(
+            _fetch_messages_from_storage,
+            self.config.storage.db_path,
+            self.target.tracked_user_ids,
+            since,
+            now,
+            [self.target.target_chat_id],
+        )
         if not messages:
             logger.info("No tracked messages since last summary.")
             return
@@ -2498,12 +2960,21 @@ async def _send_message_with_fallback(
 ) -> None:
     try:
         await _send_with_backoff(client, entity, message, on_flood_wait=on_flood_wait, **kwargs)
+        _mark_sender_fallback_recovered(client, entity)
         return
     except Exception as exc:
         if fallback_client is None or fallback_client is client:
             raise
-        logger.warning("Sender failed to send message; retrying with primary: %s", exc)
+        logger.warning("Sender failed to send message; reconnecting sender before fallback: %s", exc)
+        try:
+            await _reconnect_send_client(client)
+            await _send_with_backoff(client, entity, message, on_flood_wait=on_flood_wait, **kwargs)
+            _mark_sender_fallback_recovered(client, entity)
+            return
+        except Exception as retry_exc:
+            logger.warning("Sender reconnect/retry failed for message; retrying with primary: %s", retry_exc)
     await _send_with_backoff(fallback_client, entity, message, on_flood_wait=on_flood_wait, **kwargs)
+    await _send_sender_fallback_alert(client, fallback_client, entity, on_flood_wait=on_flood_wait)
 
 
 async def _send_file_with_fallback(
@@ -2516,12 +2987,64 @@ async def _send_file_with_fallback(
 ) -> None:
     try:
         await _send_file_with_backoff(client, entity, file_path, on_flood_wait=on_flood_wait, **kwargs)
+        _mark_sender_fallback_recovered(client, entity)
         return
     except Exception as exc:
         if fallback_client is None or fallback_client is client:
             raise
-        logger.warning("Sender failed to send file; retrying with primary: %s", exc)
+        logger.warning("Sender failed to send file; reconnecting sender before fallback: %s", exc)
+        try:
+            await _reconnect_send_client(client)
+            await _send_file_with_backoff(client, entity, file_path, on_flood_wait=on_flood_wait, **kwargs)
+            _mark_sender_fallback_recovered(client, entity)
+            return
+        except Exception as retry_exc:
+            logger.warning("Sender reconnect/retry failed for file; retrying with primary: %s", retry_exc)
     await _send_file_with_backoff(fallback_client, entity, file_path, on_flood_wait=on_flood_wait, **kwargs)
+    await _send_sender_fallback_alert(client, fallback_client, entity, on_flood_wait=on_flood_wait)
+
+
+async def _reconnect_send_client(client: TelegramClient) -> None:
+    connect = getattr(client, "connect", None)
+    if connect is None:
+        return
+    await connect()
+
+
+def _mark_sender_fallback_recovered(client: TelegramClient, entity: int | str) -> None:
+    alerted = getattr(client, "_tgwatch_sender_fallback_alert_sent", None)
+    if isinstance(alerted, set):
+        alerted.discard(_sender_fallback_alert_key(entity))
+
+
+async def _send_sender_fallback_alert(
+    sender_client: TelegramClient,
+    fallback_client: TelegramClient,
+    entity: int | str,
+    *,
+    on_flood_wait: Callable[[int], float] | None = None,
+) -> None:
+    alert_key = _sender_fallback_alert_key(entity)
+    alerted = getattr(sender_client, "_tgwatch_sender_fallback_alert_sent", None)
+    if not isinstance(alerted, set):
+        alerted = set()
+        setattr(sender_client, "_tgwatch_sender_fallback_alert_sent", alerted)
+    if alert_key in alerted:
+        return
+    try:
+        await _send_with_backoff(
+            fallback_client,
+            entity,
+            _SENDER_FALLBACK_ALERT,
+            on_flood_wait=on_flood_wait,
+        )
+        alerted.add(alert_key)
+    except Exception as alert_exc:
+        logger.warning("Failed to send sender fallback alert: %s", alert_exc)
+
+
+def _sender_fallback_alert_key(entity: int | str) -> str:
+    return f"{type(entity).__name__}:{entity}"
 
 
 async def _resolve_entity(

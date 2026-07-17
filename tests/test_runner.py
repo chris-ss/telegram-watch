@@ -7,11 +7,14 @@ from datetime import datetime, timedelta, timezone
 import logging
 import shutil
 import sqlite3
+import threading
+import time
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 
 import pytest
 from telethon import errors
+from telethon.tl import types as tl_types
 
 from telegram_watch import runner
 from telegram_watch.config import (
@@ -29,6 +32,35 @@ from telegram_watch.config import (
 from telegram_watch import storage
 from telegram_watch.storage import DbMedia, DbMessage
 from telegram_watch.timeutils import utc_now
+
+
+@pytest.mark.asyncio
+async def test_async_sqlite_gate_serializes_blocking_work() -> None:
+    gate = runner._AsyncSqliteGate()
+    state_lock = threading.Lock()
+    active = 0
+    peak_active = 0
+
+    def blocking_work(value: int) -> int:
+        nonlocal active, peak_active
+        with state_lock:
+            active += 1
+            peak_active = max(peak_active, active)
+        time.sleep(0.02)
+        with state_lock:
+            active -= 1
+        return value
+
+    results = await asyncio.gather(
+        gate.run(blocking_work, 1),
+        gate.run(blocking_work, 2),
+        gate.run(blocking_work, 3),
+    )
+
+    assert results == [1, 2, 3]
+    assert peak_active == 1
+    assert gate.pending == 0
+    assert gate.pending_since is None
 
 
 def build_config(tmp_path: Path) -> Config:
@@ -640,6 +672,249 @@ async def test_full_archive_handler_captures_non_tracked_message(tmp_path: Path)
 
     assert row == (999, "non tracked context", "archive")
     assert tracked_db_link_count == 1
+
+
+@pytest.mark.asyncio
+async def test_full_archive_handler_caches_and_updates_sender_snapshot(tmp_path: Path):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    handler = runner._FullArchiveHandler(config)
+    sender_calls = 0
+
+    async def get_sender():
+        nonlocal sender_calls
+        sender_calls += 1
+        return tl_types.User(
+            id=999,
+            first_name="Alice",
+            last_name="Example",
+            username="alice",
+        )
+
+    for message_id in (1, 2):
+        await handler.handle(
+            SimpleNamespace(
+                message=make_archive_event_message(
+                    message_id=message_id,
+                    sender_id=999,
+                ),
+                get_sender=get_sender,
+            )
+        )
+
+    shard_path = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-05.sqlite3"
+    )
+    conn = sqlite3.connect(shard_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT username, display_name, first_seen_at, last_seen_at
+            FROM archive_senders
+            WHERE sender_id = ?
+            """,
+            (999,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert sender_calls == 1
+    assert row == (
+        "alice",
+        "Alice Example",
+        "2026-05-01T12:01:00+00:00",
+        "2026-05-01T12:02:00+00:00",
+    )
+
+
+@pytest.mark.asyncio
+async def test_full_archive_handler_keeps_message_when_sender_lookup_fails(
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    handler = runner._FullArchiveHandler(config)
+
+    async def get_sender():
+        raise RuntimeError("sender unavailable")
+
+    await handler.handle(
+        SimpleNamespace(
+            message=make_archive_event_message(sender_id=999),
+            get_sender=get_sender,
+        )
+    )
+
+    shard_path = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-05.sqlite3"
+    )
+    conn = sqlite3.connect(shard_path)
+    try:
+        message_count = conn.execute(
+            "SELECT COUNT(*) FROM archive_messages"
+        ).fetchone()[0]
+        sender_count = conn.execute(
+            "SELECT COUNT(*) FROM archive_senders"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    assert message_count == 1
+    assert sender_count == 0
+
+
+@pytest.mark.asyncio
+async def test_full_archive_handler_retries_sender_after_failure_cooldown(
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    handler = runner._FullArchiveHandler(config)
+    sender_calls = 0
+
+    async def get_sender():
+        nonlocal sender_calls
+        sender_calls += 1
+        if sender_calls == 1:
+            raise RuntimeError("temporary sender lookup failure")
+        return tl_types.User(
+            id=999,
+            first_name="Recovered",
+            last_name="Sender",
+            username="recovered_sender",
+        )
+
+    for message_id in (1, 2):
+        await handler.handle(
+            SimpleNamespace(
+                message=make_archive_event_message(
+                    message_id=message_id,
+                    sender_id=999,
+                ),
+                get_sender=get_sender,
+            )
+        )
+    assert sender_calls == 1
+
+    handler._sender_lookup_retry_after[999] = 0
+    await handler.handle(
+        SimpleNamespace(
+            message=make_archive_event_message(message_id=3, sender_id=999),
+            get_sender=get_sender,
+        )
+    )
+
+    shard_path = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-05.sqlite3"
+    )
+    conn = sqlite3.connect(shard_path)
+    try:
+        message_count = conn.execute(
+            "SELECT COUNT(*) FROM archive_messages"
+        ).fetchone()[0]
+        sender_row = conn.execute(
+            "SELECT username, display_name FROM archive_senders WHERE sender_id = ?",
+            (999,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert sender_calls == 2
+    assert message_count == 3
+    assert sender_row == ("recovered_sender", "Recovered Sender")
+
+
+@pytest.mark.asyncio
+async def test_full_archive_handler_honors_sender_lookup_floodwait(
+    tmp_path: Path,
+    caplog,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    handler = runner._FullArchiveHandler(config)
+    sender_calls = 0
+
+    async def get_sender():
+        nonlocal sender_calls
+        sender_calls += 1
+        raise errors.FloodWaitError(None, 120)
+
+    loop = asyncio.get_running_loop()
+    with caplog.at_level(logging.WARNING):
+        for message_id in (1, 2):
+            await handler.handle(
+                SimpleNamespace(
+                    message=make_archive_event_message(
+                        message_id=message_id,
+                        sender_id=999,
+                    ),
+                    get_sender=get_sender,
+                )
+            )
+
+    retry_delay = handler._sender_lookup_retry_after[999] - loop.time()
+    shard_path = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-05.sqlite3"
+    )
+    conn = sqlite3.connect(shard_path)
+    try:
+        message_count = conn.execute(
+            "SELECT COUNT(*) FROM archive_messages"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    assert sender_calls == 1
+    assert retry_delay > 119
+    assert retry_delay <= 121
+    assert message_count == 2
+    assert "FloodWait during full archive sender lookup" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_full_archive_handler_keeps_message_when_sender_entity_is_invalid(
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    handler = runner._FullArchiveHandler(config)
+
+    async def get_sender():
+        return object()
+
+    await handler.handle(
+        SimpleNamespace(
+            message=make_archive_event_message(sender_id=999),
+            get_sender=get_sender,
+        )
+    )
+
+    shard_path = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-05.sqlite3"
+    )
+    conn = sqlite3.connect(shard_path)
+    try:
+        message_count = conn.execute(
+            "SELECT COUNT(*) FROM archive_messages"
+        ).fetchone()[0]
+        sender_count = conn.execute(
+            "SELECT COUNT(*) FROM archive_senders"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    assert message_count == 1
+    assert sender_count == 0
 
 
 @pytest.mark.asyncio
@@ -1742,6 +2017,57 @@ async def test_run_daemon_registers_full_archive_handler_when_enabled(
     )
 
 
+def test_full_archive_runtime_migrates_sender_only_schema_before_health_gate(
+    tmp_path: Path,
+    caplog,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    tracked = storage.connect(config.storage.db_path)
+    try:
+        storage.ensure_schema(tracked)
+    finally:
+        tracked.close()
+    archive_message = runner._archive_message_from_telegram(
+        make_archive_event_message(sender_id=999)
+    )
+    assert archive_message is not None
+    runner._persist_archive_message_to_storage(
+        config,
+        archive_message,
+        tracked_db_path=config.storage.db_path,
+    )
+    shard_path = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-05.sqlite3"
+    )
+    shard = sqlite3.connect(shard_path)
+    try:
+        shard.execute("DROP TABLE archive_senders")
+        shard.commit()
+    finally:
+        shard.close()
+
+    before = runner.inspect_archive_status(
+        config.full_archive.root_dir,
+        tracked_db_path=config.storage.db_path,
+    )
+    assert before.degraded is True
+    assert runner.only_archive_sender_schema_missing(before) is True
+
+    with caplog.at_level(logging.INFO):
+        enabled = runner._full_archive_runtime_enabled(config)
+
+    after = runner.inspect_archive_status(
+        config.full_archive.root_dir,
+        tracked_db_path=config.storage.db_path,
+    )
+    assert enabled is True
+    assert after.degraded is False
+    assert "Added archive_senders table to 1 existing full archive shard" in caplog.text
+
+
 @pytest.mark.asyncio
 async def test_run_daemon_skips_full_archive_handlers_when_archive_degraded(
     monkeypatch,
@@ -1783,6 +2109,7 @@ async def test_run_daemon_skips_full_archive_handlers_when_archive_degraded(
         "inspect_archive_status",
         lambda *_args, **_kwargs: SimpleNamespace(
             degraded=True,
+            shards=(),
             errors=("hidden shard data",),
         ),
     )
@@ -2854,6 +3181,310 @@ async def test_archive_backfill_requires_full_archive_enabled(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_archive_senders_backfill_dry_run_does_not_connect_to_telegram(
+    monkeypatch,
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    archive_message = runner._archive_message_from_telegram(
+        make_archive_event_message(sender_id=999)
+    )
+    assert archive_message is not None
+    runner._persist_archive_message_to_storage(
+        config,
+        archive_message,
+        tracked_db_path=config.storage.db_path,
+    )
+    shard_path = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-05.sqlite3"
+    )
+    shard = sqlite3.connect(shard_path)
+    try:
+        shard.execute("DROP TABLE archive_senders")
+        shard.commit()
+    finally:
+        shard.close()
+
+    def fail_build_client(_config):
+        raise AssertionError("dry-run sender backfill must not connect to Telegram")
+
+    monkeypatch.setattr(runner, "_build_client", fail_build_client)
+
+    stats = await runner.run_archive_senders_backfill(config)
+
+    assert stats.candidates == 1
+    assert stats.schema_updates == 0
+    assert stats.written_senders == 0
+    assert stats.dry_run is True
+    shard = sqlite3.connect(shard_path)
+    try:
+        sender_table = shard.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+            ("archive_senders",),
+        ).fetchone()
+    finally:
+        shard.close()
+    assert sender_table is None
+
+
+@pytest.mark.asyncio
+async def test_archive_senders_backfill_zero_limit_is_noop_without_schema_write(
+    monkeypatch,
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    archive_message = runner._archive_message_from_telegram(
+        make_archive_event_message(sender_id=999)
+    )
+    assert archive_message is not None
+    runner._persist_archive_message_to_storage(
+        config,
+        archive_message,
+        tracked_db_path=config.storage.db_path,
+    )
+    shard_path = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-05.sqlite3"
+    )
+    shard = sqlite3.connect(shard_path)
+    try:
+        shard.execute("DROP TABLE archive_senders")
+        shard.commit()
+    finally:
+        shard.close()
+
+    def fail_build_client(_config):
+        raise AssertionError("zero-limit sender backfill must not connect to Telegram")
+
+    monkeypatch.setattr(runner, "_build_client", fail_build_client)
+
+    stats = await runner.run_archive_senders_backfill(config, limit=0, apply=True)
+
+    shard = sqlite3.connect(shard_path)
+    try:
+        sender_table = shard.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+            ("archive_senders",),
+        ).fetchone()
+    finally:
+        shard.close()
+
+    assert stats.candidates == 0
+    assert stats.schema_updates == 0
+    assert stats.written_senders == 0
+    assert stats.dry_run is False
+    assert sender_table is None
+
+
+@pytest.mark.asyncio
+async def test_archive_senders_backfill_reuses_other_shard_without_telegram(
+    monkeypatch,
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    may_message = runner._archive_message_from_telegram(
+        make_archive_event_message(message_id=1, sender_id=999)
+    )
+    june_event_message = make_archive_event_message(message_id=2, sender_id=999)
+    june_event_message.date = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
+    june_message = runner._archive_message_from_telegram(june_event_message)
+    assert may_message is not None
+    assert june_message is not None
+    runner._persist_archive_message_to_storage(
+        config,
+        may_message,
+        tracked_db_path=config.storage.db_path,
+        sender_snapshot=runner.ArchiveSender(
+            sender_id=999,
+            username="existing_user",
+            display_name="Existing User",
+            first_seen_at=may_message.date,
+            last_seen_at=may_message.date,
+        ),
+    )
+    runner._persist_archive_message_to_storage(
+        config,
+        june_message,
+        tracked_db_path=config.storage.db_path,
+    )
+
+    def fail_build_client(_config):
+        raise AssertionError("existing archive snapshot must skip Telegram")
+
+    monkeypatch.setattr(runner, "_build_client", fail_build_client)
+
+    stats = await runner.run_archive_senders_backfill(config, apply=True)
+
+    june_shard = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-06.sqlite3"
+    )
+    conn = sqlite3.connect(june_shard)
+    try:
+        row = conn.execute(
+            "SELECT username, display_name FROM archive_senders WHERE sender_id = ?",
+            (999,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert stats.reused == 1
+    assert stats.cached == 0
+    assert stats.fetched == 0
+    assert stats.written_senders == 1
+    assert stats.shard_writes == 2
+    assert row == ("existing_user", "Existing User")
+
+
+@pytest.mark.asyncio
+async def test_archive_senders_backfill_prefers_session_entity_cache(
+    monkeypatch,
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    archive_message = runner._archive_message_from_telegram(
+        make_archive_event_message(sender_id=999)
+    )
+    assert archive_message is not None
+    runner._persist_archive_message_to_storage(
+        config,
+        archive_message,
+        tracked_db_path=config.storage.db_path,
+    )
+    shard_path = (
+        config.full_archive.root_dir
+        / "shards"
+        / f"group_{config.full_archive.source_chat_id}"
+        / "2026-05.sqlite3"
+    )
+    shard = sqlite3.connect(shard_path)
+    try:
+        shard.execute("DROP TABLE archive_senders")
+        shard.commit()
+    finally:
+        shard.close()
+
+    class DummySession:
+        def get_cached_sender_identity(self, sender_id):
+            assert sender_id == 999
+            return runner._ArchiveSenderIdentity(
+                username="cached_user",
+                display_name="Cached User",
+            )
+
+    class DummyClient:
+        session = DummySession()
+
+        async def get_messages(self, *_args, **_kwargs):
+            raise AssertionError("session cache hit must skip Telegram history")
+
+        async def disconnect(self):
+            return None
+
+    async def fake_start_client(_client, _role):
+        return None
+
+    monkeypatch.setattr(runner, "_build_client", lambda _config: DummyClient())
+    monkeypatch.setattr(runner, "_start_client", fake_start_client)
+
+    stats = await runner.run_archive_senders_backfill(config, apply=True)
+
+    conn = sqlite3.connect(shard_path)
+    try:
+        row = conn.execute(
+            "SELECT username, display_name FROM archive_senders WHERE sender_id = ?",
+            (999,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert stats.schema_updates == 1
+    assert stats.cached == 1
+    assert stats.fetched == 0
+    assert stats.written_senders == 1
+    assert stats.shard_writes == 1
+    assert row == ("cached_user", "Cached User")
+
+
+@pytest.mark.asyncio
+async def test_archive_senders_backfill_fetches_history_with_floodwait_retry(
+    monkeypatch,
+    tmp_path: Path,
+):
+    config = enable_full_archive(build_config(tmp_path), tmp_path)
+    archive_message = runner._archive_message_from_telegram(
+        make_archive_event_message(sender_id=999)
+    )
+    assert archive_message is not None
+    runner._persist_archive_message_to_storage(
+        config,
+        archive_message,
+        tracked_db_path=config.storage.db_path,
+    )
+    get_message_calls = 0
+    get_sender_calls = 0
+    sleeps: list[float] = []
+
+    class DummySession:
+        def get_cached_sender_identity(self, sender_id):
+            assert sender_id == 999
+            return None
+
+    class HistoryMessage:
+        async def get_sender(self):
+            nonlocal get_sender_calls
+            get_sender_calls += 1
+            return tl_types.User(
+                id=999,
+                first_name="History",
+                last_name="User",
+                username="history_user",
+            )
+
+    class DummyClient:
+        session = DummySession()
+
+        async def get_messages(self, chat_id, *, ids):
+            nonlocal get_message_calls
+            assert chat_id == config.full_archive.source_chat_id
+            assert ids == archive_message.message_id
+            get_message_calls += 1
+            if get_message_calls == 1:
+                raise errors.FloodWaitError(None, 0)
+            return HistoryMessage()
+
+        async def disconnect(self):
+            return None
+
+    async def fake_start_client(_client, _role):
+        return None
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(runner, "_build_client", lambda _config: DummyClient())
+    monkeypatch.setattr(runner, "_start_client", fake_start_client)
+    monkeypatch.setattr(runner.asyncio, "sleep", fake_sleep)
+
+    stats = await runner.run_archive_senders_backfill(config, apply=True)
+
+    assert get_message_calls == 2
+    assert get_sender_calls == 1
+    assert sleeps == [1]
+    assert stats.cached == 0
+    assert stats.fetched == 1
+    assert stats.unresolved == 0
+    assert stats.written_senders == 1
+
+
+@pytest.mark.asyncio
 async def test_list_topics_fetches_forum_topics(monkeypatch, tmp_path: Path):
     config = build_config(tmp_path)
     requests = []
@@ -3186,6 +3817,79 @@ async def test_run_once_multi_target_generates_unique_report_files(monkeypatch, 
     assert len(report_paths) == 2
     assert len(set(report_paths)) == 2
     assert sorted(path.name for path in report_paths) == ["index_-1001.html", "index_-1002.html"]
+
+
+@pytest.mark.asyncio
+async def test_run_once_push_passes_primary_fallback_when_sender_is_active(
+    monkeypatch, tmp_path: Path
+):
+    config = build_config(tmp_path)
+    since = datetime.now(timezone.utc) - timedelta(hours=1)
+
+    class DummyClient:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.disconnected = False
+
+        async def disconnect(self) -> None:
+            self.disconnected = True
+
+    capture_primary = DummyClient("capture-primary")
+    fallback_primary = DummyClient("fallback-primary")
+    sender = DummyClient("sender")
+    built_clients = iter([capture_primary, fallback_primary])
+    pushed: dict[str, object] = {}
+
+    @contextmanager
+    def fake_db_session(_path: Path):
+        yield object()
+
+    async def fake_start_client(_client, _role):
+        return None
+
+    async def fake_collect_window(_client, _config, _target, _since):
+        return []
+
+    async def fake_start_sender_client(_config):
+        return sender
+
+    def fake_fetch_messages_between(_conn, _ids, _since, _until, **_kwargs):
+        return []
+
+    def fake_generate_report(_messages, _config, _since, _until, **kwargs):
+        return kwargs["report_dir"] / kwargs["report_name"]
+
+    async def fake_push_once_reports(
+        client,
+        _config,
+        _targets,
+        _stored_by_target,
+        _since,
+        _until,
+        _report_paths,
+        *,
+        fallback_client=None,
+        **_kwargs,
+    ):
+        pushed["client"] = client
+        pushed["fallback_client"] = fallback_client
+
+    monkeypatch.setattr(runner, "_build_client", lambda _config: next(built_clients))
+    monkeypatch.setattr(runner, "_start_client", fake_start_client)
+    monkeypatch.setattr(runner, "_start_sender_client", fake_start_sender_client)
+    monkeypatch.setattr(runner, "_collect_window", fake_collect_window)
+    monkeypatch.setattr(runner, "db_session", fake_db_session)
+    monkeypatch.setattr(runner, "persist_message", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runner, "fetch_messages_between", fake_fetch_messages_between)
+    monkeypatch.setattr(runner, "generate_report", fake_generate_report)
+    monkeypatch.setattr(runner, "_push_once_reports", fake_push_once_reports)
+
+    await runner.run_once(config, since, push=True)
+
+    assert pushed == {"client": sender, "fallback_client": fallback_primary}
+    assert capture_primary.disconnected is True
+    assert sender.disconnected is True
+    assert fallback_primary.disconnected is True
 
 
 @pytest.mark.asyncio
@@ -3729,6 +4433,187 @@ def test_extract_time_format_strips_date() -> None:
 
 
 # --- Reconnect logic tests ---
+
+
+class _FakeSendClient:
+    def __init__(
+        self,
+        *,
+        connected: bool = True,
+        fail_after_connect: bool = False,
+        fail_messages: set[str] | None = None,
+        fail_entities: set[object] | None = None,
+    ) -> None:
+        self.connected = connected
+        self.fail_after_connect = fail_after_connect
+        self.fail_messages = set(fail_messages or ())
+        self.fail_entities = set(fail_entities or ())
+        self.connect_count = 0
+        self.sent_messages: list[tuple[object, str]] = []
+        self.sent_files: list[tuple[object, Path]] = []
+
+    async def connect(self) -> None:
+        self.connect_count += 1
+        self.connected = True
+
+    async def get_input_entity(self, entity):
+        return f"resolved:{entity}"
+
+    async def send_message(self, entity, message, **_kwargs) -> None:
+        if (
+            not self.connected
+            or self.fail_after_connect
+            or message in self.fail_messages
+            or entity in self.fail_entities
+        ):
+            raise RuntimeError("Cannot send requests while disconnected")
+        self.sent_messages.append((entity, message))
+
+    async def send_file(self, entity, *, file, **_kwargs) -> None:
+        if not self.connected or self.fail_after_connect:
+            raise RuntimeError("Cannot send requests while disconnected")
+        self.sent_files.append((entity, Path(file)))
+
+
+@pytest.mark.asyncio
+async def test_send_message_reconnects_sender_before_primary_fallback() -> None:
+    sender = _FakeSendClient(connected=False)
+    primary = _FakeSendClient()
+
+    await runner._send_message_with_fallback(sender, primary, "control", "hello")
+
+    assert sender.connect_count == 1
+    assert sender.sent_messages == [("resolved:control", "hello")]
+    assert primary.sent_messages == []
+
+
+@pytest.mark.asyncio
+async def test_send_file_reconnects_sender_before_primary_fallback(tmp_path: Path) -> None:
+    sender = _FakeSendClient(connected=False)
+    primary = _FakeSendClient()
+    attachment = tmp_path / "report.txt"
+    attachment.write_text("report", encoding="utf-8")
+
+    await runner._send_file_with_fallback(sender, primary, "control", attachment)
+
+    assert sender.connect_count == 1
+    assert sender.sent_files == [("resolved:control", attachment)]
+    assert primary.sent_files == []
+
+
+@pytest.mark.asyncio
+async def test_send_message_falls_back_to_primary_when_sender_retry_fails() -> None:
+    sender = _FakeSendClient(connected=False, fail_after_connect=True)
+    primary = _FakeSendClient()
+
+    await runner._send_message_with_fallback(sender, primary, "control", "hello")
+
+    assert sender.connect_count == 1
+    assert sender.sent_messages == []
+    assert primary.sent_messages == [
+        ("resolved:control", "hello"),
+        ("resolved:control", runner._SENDER_FALLBACK_ALERT),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_send_file_fallback_warns_control_chat_when_sender_retry_fails(tmp_path: Path) -> None:
+    sender = _FakeSendClient(connected=False, fail_after_connect=True)
+    primary = _FakeSendClient()
+    attachment = tmp_path / "report.txt"
+    attachment.write_text("report", encoding="utf-8")
+
+    await runner._send_file_with_fallback(sender, primary, "control", attachment)
+
+    assert sender.connect_count == 1
+    assert sender.sent_files == []
+    assert primary.sent_files == [("resolved:control", attachment)]
+    assert primary.sent_messages == [("resolved:control", runner._SENDER_FALLBACK_ALERT)]
+
+
+@pytest.mark.asyncio
+async def test_sender_fallback_alert_is_sent_once_until_sender_recovers() -> None:
+    sender = _FakeSendClient(connected=False, fail_after_connect=True)
+    primary = _FakeSendClient()
+
+    await runner._send_message_with_fallback(sender, primary, "control", "first")
+    await runner._send_message_with_fallback(sender, primary, "control", "second")
+
+    assert primary.sent_messages == [
+        ("resolved:control", "first"),
+        ("resolved:control", runner._SENDER_FALLBACK_ALERT),
+        ("resolved:control", "second"),
+    ]
+
+    sender.fail_after_connect = False
+    await runner._send_message_with_fallback(sender, primary, "control", "recovered")
+
+    sender.fail_after_connect = True
+    sender.connected = False
+    await runner._send_message_with_fallback(sender, primary, "control", "third")
+
+    assert primary.sent_messages == [
+        ("resolved:control", "first"),
+        ("resolved:control", runner._SENDER_FALLBACK_ALERT),
+        ("resolved:control", "second"),
+        ("resolved:control", "third"),
+        ("resolved:control", runner._SENDER_FALLBACK_ALERT),
+    ]
+    assert sender.sent_messages == [("resolved:control", "recovered")]
+
+
+@pytest.mark.asyncio
+async def test_sender_fallback_alert_is_throttled_per_control_chat() -> None:
+    sender = _FakeSendClient(connected=False, fail_after_connect=True)
+    primary = _FakeSendClient()
+
+    await runner._send_message_with_fallback(sender, primary, "control-a", "first")
+    await runner._send_message_with_fallback(sender, primary, "control-b", "second")
+    await runner._send_message_with_fallback(sender, primary, "control-a", "third")
+
+    assert primary.sent_messages == [
+        ("resolved:control-a", "first"),
+        ("resolved:control-a", runner._SENDER_FALLBACK_ALERT),
+        ("resolved:control-b", "second"),
+        ("resolved:control-b", runner._SENDER_FALLBACK_ALERT),
+        ("resolved:control-a", "third"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sender_fallback_recovery_only_clears_recovered_control_chat() -> None:
+    sender = _FakeSendClient(connected=True, fail_entities={"resolved:control-a"})
+    primary = _FakeSendClient()
+
+    await runner._send_message_with_fallback(sender, primary, "control-a", "first")
+    await runner._send_message_with_fallback(sender, primary, "control-b", "second")
+    await runner._send_message_with_fallback(sender, primary, "control-a", "third")
+
+    assert sender.sent_messages == [("resolved:control-b", "second")]
+    assert primary.sent_messages == [
+        ("resolved:control-a", "first"),
+        ("resolved:control-a", runner._SENDER_FALLBACK_ALERT),
+        ("resolved:control-a", "third"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sender_fallback_alert_retries_after_alert_delivery_failure() -> None:
+    sender = _FakeSendClient(connected=False, fail_after_connect=True)
+    primary = _FakeSendClient(fail_messages={runner._SENDER_FALLBACK_ALERT})
+
+    await runner._send_message_with_fallback(sender, primary, "control", "first")
+
+    assert primary.sent_messages == [("resolved:control", "first")]
+
+    primary.fail_messages.clear()
+    await runner._send_message_with_fallback(sender, primary, "control", "second")
+
+    assert primary.sent_messages == [
+        ("resolved:control", "first"),
+        ("resolved:control", "second"),
+        ("resolved:control", runner._SENDER_FALLBACK_ALERT),
+    ]
 
 
 class _FakeClient:
